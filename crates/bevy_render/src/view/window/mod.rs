@@ -234,6 +234,38 @@ pub struct SurfaceData {
     texture_view_format: Option<TextureFormat>,
 }
 
+impl SurfaceData {
+    /// The window's surface, for capability and display queries.
+    pub fn surface(&self) -> &wgpu::Surface<'static> {
+        &self.surface
+    }
+
+    /// The configuration currently applied to the surface.
+    pub fn configuration(&self) -> &SurfaceConfiguration {
+        &self.configuration
+    }
+
+    /// Reconfigures the surface with `format` and `color_space`. Later resizes and present-mode
+    /// changes keep both. Drop the window's swap chain texture before calling this.
+    pub fn set_format(
+        &mut self,
+        render_device: &RenderDevice,
+        format: TextureFormat,
+        color_space: wgpu::SurfaceColorSpace,
+    ) {
+        self.texture_view_format = srgb_view_format(format);
+        self.configuration.format = format;
+        self.configuration.color_space = color_space;
+        self.configuration.view_formats = self.texture_view_format.into_iter().collect();
+        render_device.configure_surface(&self.surface, &self.configuration);
+    }
+}
+
+/// The sRGB view format shaders render through, when it differs from a non-sRGB `format`.
+fn srgb_view_format(format: TextureFormat) -> Option<TextureFormat> {
+    (!format.is_srgb()).then(|| format.add_srgb_suffix())
+}
+
 /// (re)configures window surfaces, and obtains a swapchain texture for rendering.
 ///
 /// NOTE: `get_current_texture` in `prepare_windows` can take a long time if the GPU workload is
@@ -411,11 +443,7 @@ pub fn create_surfaces(
                 }
             }
 
-            let texture_view_format = if !format.is_srgb() {
-                Some(format.add_srgb_suffix())
-            } else {
-                None
-            };
+            let texture_view_format = srgb_view_format(format);
             let configuration = SurfaceConfiguration {
                 format,
                 width: window.physical_width,
