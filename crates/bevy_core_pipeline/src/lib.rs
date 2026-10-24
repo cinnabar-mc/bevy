@@ -36,7 +36,9 @@ use crate::{
     upscaling::UpscalingPlugin,
 };
 use bevy_app::{App, Plugin};
-use bevy_render::renderer::{RenderGraph, RenderGraphSystems};
+use bevy_render::renderer::{
+    encode_screenshot_and_readback_commands, RenderGraph, RenderGraphSystems,
+};
 use bevy_render::RenderApp;
 use bevy_shader::load_shader_library;
 use oit::OrderIndependentTransparencyPlugin;
@@ -65,7 +67,12 @@ impl Plugin for CorePipelinePlugin {
             RenderGraph,
             (
                 camera_driver.in_set(RenderGraphSystems::Render),
-                (submit_pending_command_buffers, handle_uncovered_swap_chains)
+                // Clears of uncovered swap chains and screenshot/readback copies are appended
+                // to the graph's command buffers so the frame goes out in one submission.
+                (
+                    handle_uncovered_swap_chains.before(encode_screenshot_and_readback_commands),
+                    submit_pending_command_buffers.after(encode_screenshot_and_readback_commands),
+                )
                     .chain()
                     .in_set(RenderGraphSystems::Submit),
             ),

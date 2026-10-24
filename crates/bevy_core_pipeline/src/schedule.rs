@@ -129,8 +129,8 @@ pub struct RootNonCameraView(#[reflect(ignore)] pub InternedScheduleLabel);
 /// schedule. This system iterates over all cameras in the world, executing their associated
 /// rendering schedules defined by the [`bevy_render::camera::CameraRenderGraph`] component.
 ///
-/// After executing all camera schedules, it submits any pending command buffers to the GPU
-/// and clears any swap chains that were not covered by a camera. Users can order any additional
+/// After all camera schedules have run, swap chains that were not covered by a camera are cleared
+/// and every pending command buffer is submitted to the GPU at once. Users can order any additional
 /// operations (e.g. one-off compute passes) before or after this system in the root render
 /// graph schedule.
 pub fn camera_driver(
@@ -307,10 +307,9 @@ pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
         return;
     }
 
-    let render_device = world.resource::<RenderDevice>();
-    let render_queue = world.resource::<RenderQueue>();
-
-    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor::default());
+    let mut encoder = world
+        .resource::<RenderDevice>()
+        .create_command_encoder(&CommandEncoderDescriptor::default());
 
     for (swap_chain_texture, clear_color) in &windows_to_clear {
         #[cfg(feature = "trace")]
@@ -336,5 +335,7 @@ pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
         encoder.begin_render_pass(&pass_descriptor);
     }
 
-    render_queue.submit([encoder.finish()]);
+    world
+        .resource_mut::<PendingCommandBuffers>()
+        .push_encoder(encoder, "handle_uncovered_swap_chains");
 }

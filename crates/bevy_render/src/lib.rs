@@ -118,7 +118,10 @@ use crate::{
     mesh::{MeshRenderAssetPlugin, RenderMesh},
     render_asset::prepare_assets,
     render_resource::{PipelineCache, SparseBufferPlugin},
-    renderer::{render_system, RenderAdapterInfo, RenderGraph},
+    renderer::{
+        encode_screenshot_and_readback_commands, render_system, RenderAdapterInfo, RenderGraph,
+        RenderGraphSystems,
+    },
     settings::{RenderCreation, WgpuLimits},
     storage::StoragePlugin,
     texture::TexturePlugin,
@@ -452,6 +455,10 @@ impl Plugin for RenderPlugin {
             render_app.init_resource::<AppFunctionRegistry>();
 
             render_app.add_schedule(RenderGraph::base_schedule());
+            render_app.add_systems(
+                RenderGraph,
+                encode_screenshot_and_readback_commands.in_set(RenderGraphSystems::Submit),
+            );
 
             render_app.init_schedule(RenderStartup);
             render_app
