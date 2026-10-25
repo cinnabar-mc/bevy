@@ -676,7 +676,7 @@ impl PipelineCache {
                             },
                         },
                     ),
-                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
+                    cache: pipeline_cache.as_deref(),
                 };
 
                 Ok(Pipeline::RenderPipeline(
@@ -740,7 +740,7 @@ impl PipelineCache {
                         zero_initialize_workgroup_memory: descriptor
                             .zero_initialize_workgroup_memory,
                     },
-                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
+                    cache: pipeline_cache.as_deref(),
                 };
 
                 Ok(Pipeline::ComputePipeline(
@@ -880,7 +880,7 @@ impl PipelineCache {
                             },
                         },
                     ),
-                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
+                    cache: pipeline_cache.as_deref(),
                 };
 
                 Ok(Pipeline::MeshPipeline(

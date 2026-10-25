@@ -24,6 +24,10 @@ fn native_driver_cache_and_worker_compilation() {
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let Ok(adapter) = bevy_tasks::block_on(instance.request_adapter(&Default::default())) else {
+        #[expect(
+            clippy::print_stderr,
+            reason = "A missing native adapter must have a visible fixture diagnostic."
+        )]
         eprintln!("missing-fixture: native Metal/Vulkan adapter for pipeline compilation");
         return;
     };

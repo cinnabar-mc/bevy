@@ -11,14 +11,9 @@ pub(super) fn create_pipeline_task(
 ) -> CachedPipelineState {
     #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
     if !synchronous && (!cfg!(target_os = "macos") || async_on_macos) {
-        return CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(
-            async move {
-                #[cfg(target_os = "macos")]
-                return compile(task);
-                #[cfg(not(target_os = "macos"))]
-                task.await
-            },
-        ));
+        #[cfg(target_os = "macos")]
+        let task = async move { compile(task) };
+        return CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task));
     }
     let _ = (synchronous, async_on_macos);
     match compile(task) {
