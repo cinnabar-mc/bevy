@@ -28,7 +28,10 @@ use bevy_render::{
         CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
         RenderPassDescriptor, StoreOp,
     },
-    renderer::{CurrentView, PendingCommandBuffers, RenderDevice, RenderQueue},
+    renderer::{
+        run_render_schedule, CurrentView, PendingCommandBuffers, RenderDevice, RenderQueue,
+        SerialRenderExecutor,
+    },
     sync_world::MainEntity,
     view::ExtractedWindow,
 };
@@ -60,6 +63,8 @@ impl Core3d {
         use Core3dSystems::*;
 
         let mut schedule = Schedule::new(Self);
+        // Systems run one at a time and share the frame's command encoder.
+        schedule.set_executor(SerialRenderExecutor::new());
 
         schedule.set_build_settings(ScheduleBuildSettings {
             auto_insert_apply_deferred: false,
@@ -99,6 +104,8 @@ impl Core2d {
         use Core2dSystems::*;
 
         let mut schedule = Schedule::new(Self);
+        // Systems run one at a time and share the frame's command encoder.
+        schedule.set_executor(SerialRenderExecutor::new());
 
         schedule.set_build_settings(ScheduleBuildSettings {
             auto_insert_apply_deferred: false,
@@ -235,7 +242,7 @@ pub fn camera_driver(
             let _span =
                 bevy_log::info_span!("camera_schedule", camera = root_view.to_string()).entered();
 
-            world.run_schedule(schedule);
+            run_render_schedule(world, schedule);
         }
     }
     if diagnostics_enabled && !reached_root_camera {
@@ -307,35 +314,30 @@ pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
         return;
     }
 
-    let mut encoder = world
-        .resource::<RenderDevice>()
-        .create_command_encoder(&CommandEncoderDescriptor::default());
+    world.resource_scope(|world, mut pending: Mut<PendingCommandBuffers>| {
+        let encoder = pending.command_encoder(world.resource::<RenderDevice>());
+        for (swap_chain_texture, clear_color) in &windows_to_clear {
+            #[cfg(feature = "trace")]
+            let _span = bevy_log::info_span!("no_camera_clear_pass").entered();
 
-    for (swap_chain_texture, clear_color) in &windows_to_clear {
-        #[cfg(feature = "trace")]
-        let _span = bevy_log::info_span!("no_camera_clear_pass").entered();
+            let pass_descriptor = RenderPassDescriptor {
+                label: Some("no_camera_clear_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: swap_chain_texture,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear((*clear_color).into()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            };
 
-        let pass_descriptor = RenderPassDescriptor {
-            label: Some("no_camera_clear_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: swap_chain_texture,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Clear((*clear_color).into()),
-                    store: StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        };
-
-        encoder.begin_render_pass(&pass_descriptor);
-    }
-
-    world
-        .resource_mut::<PendingCommandBuffers>()
-        .push_encoder(encoder, "handle_uncovered_swap_chains");
+            encoder.begin_render_pass(&pass_descriptor);
+        }
+    });
 }

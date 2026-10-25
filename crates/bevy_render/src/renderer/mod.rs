@@ -5,7 +5,8 @@ mod render_device;
 mod wgpu_wrapper;
 
 pub use render_context::{
-    CurrentView, FlushCommands, PendingCommandBuffers, RenderContext, RenderContextState, ViewQuery,
+    run_render_schedule, CurrentView, FlushCommands, PendingCommandBuffers, RenderContext,
+    RenderContextState, SerialRenderExecutor, ViewQuery,
 };
 pub use render_device::*;
 
@@ -44,12 +45,16 @@ use wgpu::{
 ///             Core3d (Schedule)
 ///             CUSTOM_PIPELINE (Schedule)
 /// ```
+///
+/// The schedule runs on a [`SerialRenderExecutor`], so its render systems share the frame's
+/// command encoder.
 #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct RenderGraph;
 
 impl RenderGraph {
     pub fn base_schedule() -> Schedule {
         let mut schedule = Schedule::new(Self);
+        schedule.set_executor(SerialRenderExecutor::new());
         schedule.configure_sets(
             (
                 RenderGraphSystems::Begin,
@@ -134,8 +139,8 @@ pub fn render_system(
     crate::view::screenshot::collect_screenshots(world);
 }
 
-/// Encodes this frame's screenshot captures and GPU readback copies after every command already
-/// pending, so they are submitted together with the render graph's command buffers.
+/// Encodes this frame's screenshot captures and GPU readback copies into the frame encoder after
+/// every command already pending, so they are submitted with the render graph's commands.
 ///
 /// Runs in [`RenderGraphSystems::Submit`], after the graph's writes to the views, render targets
 /// and swap chains it copies from and before the pending command buffers are submitted. Frames
@@ -150,21 +155,15 @@ pub fn encode_screenshot_and_readback_commands(
         return;
     }
 
-    let mut encoder =
-        world
-            .resource::<RenderDevice>()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("screenshot_and_readback"),
-            });
-    if screenshots {
-        crate::view::screenshot::submit_screenshot_commands(world, screenshot_state, &mut encoder);
-    }
-    if readbacks {
-        crate::gpu_readback::submit_readback_commands(world, &mut encoder);
-    }
-    world
-        .resource_mut::<PendingCommandBuffers>()
-        .push_encoder(encoder, "encode_screenshot_and_readback_commands");
+    world.resource_scope(|world, mut pending: Mut<PendingCommandBuffers>| {
+        let encoder = pending.command_encoder(world.resource::<RenderDevice>());
+        if screenshots {
+            crate::view::screenshot::submit_screenshot_commands(world, screenshot_state, encoder);
+        }
+        if readbacks {
+            crate::gpu_readback::submit_readback_commands(world, encoder);
+        }
+    });
 }
 
 wgpu_wrapper! {
