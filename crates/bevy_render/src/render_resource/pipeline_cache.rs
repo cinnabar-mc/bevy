@@ -24,8 +24,12 @@ use bevy_shader::{
 };
 use bevy_tasks::Task;
 use bevy_utils::default;
-use core::{future::Future, mem};
+use core::mem;
+
+#[path = "pipeline_cache/tasks.rs"]
+mod tasks;
 use std::sync::{Mutex, PoisonError};
+use tasks::create_pipeline_task;
 use wgpu::{PipelineCompilationOptions, VertexBufferLayout as RawVertexBufferLayout};
 
 /// A pipeline defining the data layout and shader logic for a specific GPU task.
@@ -95,6 +99,9 @@ wgpu_wrapper! {
     struct WgpuPipelineLayout(PipelineLayout);
 
     struct WgpuShaderModule(ShaderModule);
+
+    #[derive(Clone)]
+    struct WgpuDriverPipelineCache(wgpu::PipelineCache);
 }
 
 #[derive(Default)]
@@ -226,8 +233,11 @@ pub struct PipelineCache {
     new_pipelines: Mutex<Vec<CachedPipeline>>,
     global_shader_defs: Vec<ShaderDefVal>,
     /// If `true`, disables asynchronous pipeline compilation.
-    /// This has no effect on macOS, wasm, or without the `multi_threaded` feature.
+    /// On macOS this also requires [`Self::set_async_pipeline_compilation_on_macos`].
+    /// This has no effect on wasm or without the `multi_threaded` feature.
     pub(crate) synchronous_pipeline_compilation: bool,
+    async_pipeline_compilation_on_macos: bool,
+    pipeline_cache: Option<WgpuDriverPipelineCache>,
     /// If `true`, the shader cache needs to be repopulated from the main world's `Assets<Shader>`.
     needs_shader_reload: bool,
 }
@@ -283,8 +293,29 @@ impl PipelineCache {
             pipelines: default(),
             global_shader_defs,
             synchronous_pipeline_compilation,
+            async_pipeline_compilation_on_macos: false,
+            pipeline_cache: None,
             needs_shader_reload: true,
         }
+    }
+
+    /// Opts into worker-thread compilation on macOS when synchronous compilation is disabled.
+    ///
+    /// The default is `false`, preserving Bevy's synchronous Metal path. Worker compiles
+    /// run inside an Objective-C autorelease pool. This does not use Metal's native
+    /// asynchronous compilation API and applications should measure their target drivers.
+    /// This has no effect on other platforms or without the `multi_threaded` feature.
+    pub fn set_async_pipeline_compilation_on_macos(&mut self, enabled: bool) {
+        self.async_pipeline_compilation_on_macos = enabled;
+    }
+
+    /// Supplies an optional driver cache for subsequently started render, compute and mesh pipelines.
+    ///
+    /// The cache must belong to this render device, with `wgpu::Features::PIPELINE_CACHE`
+    /// enabled. Currently wgpu supports this only on Vulkan. The application owns cache
+    /// creation and persistence; `None` preserves the default behavior.
+    pub fn set_pipeline_cache(&mut self, cache: Option<wgpu::PipelineCache>) {
+        self.pipeline_cache = cache.map(WgpuDriverPipelineCache::new);
     }
 
     /// Get the state of a cached render pipeline.
@@ -539,6 +570,7 @@ impl PipelineCache {
         descriptor: RenderPipelineDescriptor,
     ) -> CachedPipelineState {
         let device = self.device.clone();
+        let pipeline_cache = self.pipeline_cache.clone();
         let shader_cache = self.shader_cache.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
@@ -644,7 +676,7 @@ impl PipelineCache {
                             },
                         },
                     ),
-                    cache: None,
+                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
                 };
 
                 Ok(Pipeline::RenderPipeline(
@@ -652,6 +684,7 @@ impl PipelineCache {
                 ))
             },
             self.synchronous_pipeline_compilation,
+            self.async_pipeline_compilation_on_macos,
         )
     }
 
@@ -661,6 +694,7 @@ impl PipelineCache {
         descriptor: ComputePipelineDescriptor,
     ) -> CachedPipelineState {
         let device = self.device.clone();
+        let pipeline_cache = self.pipeline_cache.clone();
         let shader_cache = self.shader_cache.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
@@ -706,7 +740,7 @@ impl PipelineCache {
                         zero_initialize_workgroup_memory: descriptor
                             .zero_initialize_workgroup_memory,
                     },
-                    cache: None,
+                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
                 };
 
                 Ok(Pipeline::ComputePipeline(
@@ -714,6 +748,7 @@ impl PipelineCache {
                 ))
             },
             self.synchronous_pipeline_compilation,
+            self.async_pipeline_compilation_on_macos,
         )
     }
 
@@ -723,6 +758,7 @@ impl PipelineCache {
         descriptor: MeshPipelineDescriptor,
     ) -> CachedPipelineState {
         let device = self.device.clone();
+        let pipeline_cache = self.pipeline_cache.clone();
         let shader_cache = self.shader_cache.clone();
         let layout_cache = self.layout_cache.clone();
         let mut bindgroup_layout_cache = self.bindgroup_layout_cache.lock().unwrap();
@@ -844,7 +880,7 @@ impl PipelineCache {
                             },
                         },
                     ),
-                    cache: None,
+                    cache: pipeline_cache.as_ref().map(|cache| &**cache),
                 };
 
                 Ok(Pipeline::MeshPipeline(
@@ -852,6 +888,7 @@ impl PipelineCache {
                 ))
             },
             self.synchronous_pipeline_compilation,
+            self.async_pipeline_compilation_on_macos,
         )
     }
     /// Process the pipeline queue and create all pending pipelines if possible.
@@ -1055,36 +1092,6 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
     }
 }
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(target_os = "macos"),
-    feature = "multi_threaded"
-))]
-fn create_pipeline_task(
-    task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    sync: bool,
-) -> CachedPipelineState {
-    if !sync {
-        return CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task));
-    }
-
-    match bevy_tasks::block_on(task) {
-        Ok(pipeline) => CachedPipelineState::Ok(pipeline),
-        Err(err) => CachedPipelineState::Err(err),
-    }
-}
-
-#[cfg(any(
-    target_arch = "wasm32",
-    target_os = "macos",
-    not(feature = "multi_threaded")
-))]
-fn create_pipeline_task(
-    task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    _sync: bool,
-) -> CachedPipelineState {
-    match bevy_tasks::block_on(task) {
-        Ok(pipeline) => CachedPipelineState::Ok(pipeline),
-        Err(err) => CachedPipelineState::Err(err),
-    }
-}
+#[cfg(test)]
+#[path = "pipeline_cache/tests.rs"]
+mod tests;

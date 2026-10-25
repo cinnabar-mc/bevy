@@ -121,6 +121,9 @@ weak-table = "0.4"
 tracing = "0.1"
 static_assertions = "1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [dev-dependencies]
 proptest = "1"
 proptest-derive = "0.8"
