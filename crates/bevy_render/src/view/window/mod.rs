@@ -6,6 +6,7 @@ use crate::{
     renderer::{RenderAdapter, RenderDevice, RenderInstance},
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
+use alloc::sync::Arc;
 use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
@@ -19,8 +20,11 @@ use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+mod present;
 pub mod screenshot;
 
+use present::PresentSlot;
+pub use present::{present_frames, SurfacePresenter, PRESENT_THREAD_ENV};
 use screenshot::ScreenshotPlugin;
 
 pub struct WindowRenderPlugin;
@@ -51,6 +55,7 @@ impl Plugin for WindowRenderPlugin {
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
+                .init_resource::<SurfacePresenter>()
                 .add_systems(ExtractSchedule, extract_windows.before(extract_cameras))
                 .add_systems(
                     Render,
@@ -58,7 +63,13 @@ impl Plugin for WindowRenderPlugin {
                         .run_if(need_surface_configuration)
                         .before(prepare_windows),
                 )
-                .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews));
+                .add_systems(Render, prepare_windows.in_set(RenderSystems::PrepareViews))
+                .add_systems(
+                    Render,
+                    present_frames
+                        .in_set(RenderSystems::Render)
+                        .after(crate::renderer::render_system),
+                );
         }
     }
 }
@@ -232,10 +243,16 @@ pub struct SurfaceData {
     surface: WgpuSurface,
     configuration: SurfaceConfiguration,
     texture_view_format: Option<TextureFormat>,
+    /// The swap chain texture `render_system` handed over for [`present_frames`] to present.
+    staged: Option<SurfaceTexture>,
+    present: Arc<PresentSlot>,
 }
 
 impl SurfaceData {
     /// The window's surface, for capability and display queries.
+    ///
+    /// Call [`wait_for_present`](Self::wait_for_present) before configuring it or acquiring a
+    /// texture from it.
     pub fn surface(&self) -> &wgpu::Surface<'static> {
         &self.surface
     }
@@ -243,6 +260,13 @@ impl SurfaceData {
     /// The configuration currently applied to the surface.
     pub fn configuration(&self) -> &SurfaceConfiguration {
         &self.configuration
+    }
+
+    /// Blocks until the present thread has presented this surface's previous frame.
+    ///
+    /// See [`SurfacePresenter`]. Returns immediately when presents run inline.
+    pub fn wait_for_present(&self) {
+        self.present.wait();
     }
 
     /// Reconfigures the surface with `format` and `color_space`. Later resizes and present-mode
@@ -253,11 +277,21 @@ impl SurfaceData {
         format: TextureFormat,
         color_space: wgpu::SurfaceColorSpace,
     ) {
+        self.wait_for_present();
         self.texture_view_format = srgb_view_format(format);
         self.configuration.format = format;
         self.configuration.color_space = color_space;
         self.configuration.view_formats = self.texture_view_format.into_iter().collect();
         render_device.configure_surface(&self.surface, &self.configuration);
+    }
+}
+
+impl Drop for SurfaceData {
+    fn drop(&mut self) {
+        // The surface must outlive its textures: discard a frame still staged for presenting and
+        // let a present in flight on the present thread return before the surface is dropped.
+        drop(self.staged.take());
+        self.wait_for_present();
     }
 }
 
@@ -343,6 +377,8 @@ pub fn prepare_windows(
             })[0]
         };
 
+        // The previous frame's present may still be running on the present thread.
+        surface_data.wait_for_present();
         let surface = &surface_data.surface;
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
@@ -474,6 +510,8 @@ pub fn create_surfaces(
                 surface: WgpuSurface::new(surface),
                 configuration,
                 texture_view_format,
+                staged: None,
+                present: Arc::default(),
             });
             continue;
         };
@@ -492,6 +530,7 @@ pub fn create_surfaces(
             data.configuration.height = window.physical_height;
             let caps = data.surface.get_capabilities(&render_adapter);
             data.configuration.present_mode = present_mode(&window, &caps);
+            data.wait_for_present();
             render_device.configure_surface(&data.surface, &data.configuration);
         }
     }

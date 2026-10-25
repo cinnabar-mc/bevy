@@ -15,7 +15,10 @@ pub(crate) use wgpu_wrapper::wgpu_wrapper;
 use crate::{
     settings::{RenderResources, WgpuSettings, WgpuSettingsPriority},
     sync_world::MainEntity,
-    view::{screenshot::SubmitScreenshotCommandsState, ExtractedWindow, ViewTarget},
+    view::{
+        screenshot::SubmitScreenshotCommandsState, ExtractedWindow, SurfaceData, SurfacePresenter,
+        ViewTarget,
+    },
 };
 use bevy_camera::NormalizedRenderTarget;
 use bevy_ecs::schedule::ScheduleLabel;
@@ -82,8 +85,12 @@ pub enum RenderGraphSystems {
 }
 
 /// The main render system that drives the rendering process. This system runs the [`RenderGraph`]
-/// schedule, submits any command buffers still pending after it, and calls present on swap chains
-/// that need to be presented.
+/// schedule, submits any command buffers still pending after it, and takes the swap chain
+/// textures of windows that need to be presented.
+///
+/// With a threaded [`SurfacePresenter`], the textures are staged for
+/// [`present_frames`](crate::view::present_frames) to hand to the present thread; otherwise they
+/// are presented here.
 ///
 /// Screenshot captures and GPU readbacks are encoded inside the graph by
 /// [`encode_screenshot_and_readback_commands`], so they reach the GPU in the graph's submission.
@@ -91,8 +98,9 @@ pub fn render_system(
     world: &mut World,
     present_state: &mut SystemState<(
         Query<(&ViewTarget, &ExtractedCamera)>,
-        Query<(MainEntity, &mut ExtractedWindow)>,
+        Query<(MainEntity, &mut ExtractedWindow, Option<&mut SurfaceData>)>,
         Res<RenderQueue>,
+        Option<Res<SurfacePresenter>>,
     )>,
 ) {
     #[cfg(feature = "trace")]
@@ -112,8 +120,9 @@ pub fn render_system(
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
-        if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
-            for (window_entity, mut window) in &mut windows {
+        if let Ok((views, mut windows, render_queue, presenter)) = present_state.get_mut(world) {
+            let presenter = presenter.filter(|presenter| presenter.is_threaded());
+            for (window_entity, mut window, surface) in &mut windows {
                 let view_needs_present = views.iter().any(|(view_target, camera)| {
                     matches!(
                         camera.target,
@@ -122,7 +131,12 @@ pub fn render_system(
                 });
 
                 if view_needs_present || window.needs_initial_present {
-                    window.present(&render_queue);
+                    match (&presenter, surface) {
+                        (Some(presenter), Some(mut surface)) => {
+                            presenter.stage(&mut window, surface.bypass_change_detection());
+                        }
+                        _ => window.present(&render_queue),
+                    }
                     window.needs_initial_present = false;
                 }
             }

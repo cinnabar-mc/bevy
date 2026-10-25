@@ -10,6 +10,7 @@
 //! - `WGPU_SETTINGS_PRIO=webgl2` uses webgl2 limits.
 //! - `WGPU_SETTINGS_PRIO=webgpu` uses webgpu limits.
 //! - `VERBOSE_SHADER_ERROR=1` prints more detailed information about WGSL compilation errors, such as shader defs and shader entrypoint.
+//! - `BEVY_PRESENT_THREAD=0` presents swap chain textures on the render thread instead of a dedicated present thread.
 
 #![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![expect(unsafe_code, reason = "Unsafe code is used to improve performance.")]
