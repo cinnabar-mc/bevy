@@ -49,7 +49,7 @@ mod tests {
     ) -> Result<Pipeline, ShaderCacheError> {
         sender.send(std::thread::current().id()).unwrap();
         Err(ShaderCacheError::ShaderNotLoaded(
-            AssetId::<Shader>::invalid(),
+            AssetId::<Shader>::default(),
         ))
     }
 
