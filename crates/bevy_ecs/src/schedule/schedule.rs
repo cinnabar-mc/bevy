@@ -481,6 +481,22 @@ impl Schedule {
         self.graph.remove_systems_in_set(set, policy)
     }
 
+    /// Removes the systems in each of `sets`, building the schedule at most once beforehand.
+    ///
+    /// Calling [`Self::remove_systems_in_set`] once per set rebuilds the whole schedule before
+    /// every removal after the first. Each set gets its own result, as if removed separately.
+    pub fn remove_systems_in_sets(
+        &mut self,
+        sets: impl IntoIterator<Item = InternedSystemSet>,
+        world: &mut World,
+        policy: ScheduleCleanupPolicy,
+    ) -> Result<Vec<Result<usize, ScheduleError>>, ScheduleError> {
+        if self.graph.changed {
+            self.initialize(world)?;
+        }
+        Ok(self.graph.remove_systems_in_sets(sets, policy))
+    }
+
     /// Suppress warnings and errors that would result from systems in these sets having ambiguities
     /// (conflicting access but indeterminate order) with systems in `set`.
     #[track_caller]
@@ -1065,7 +1081,42 @@ impl ScheduleGraph {
         let interned = set.intern();
         // clone the keys out of the schedule as the systems are getting removed from self
         let keys = self.systems_in_set(interned)?.clone();
+        self.remove_planned(interned, keys, policy)
+    }
 
+    /// Removes several sets' systems, looking up every set before any removal changes the graph.
+    ///
+    /// A system in more than one of the sets is removed, and counted, with the first of them.
+    pub fn remove_systems_in_sets(
+        &mut self,
+        sets: impl IntoIterator<Item = InternedSystemSet>,
+        policy: ScheduleCleanupPolicy,
+    ) -> Vec<Result<usize, ScheduleError>> {
+        let planned: Vec<Result<_, ScheduleError>> = sets
+            .into_iter()
+            .map(|set| Ok((set, self.systems_in_set(set)?.clone())))
+            .collect();
+        let mut removed = HashSet::<SystemKey>::default();
+        planned
+            .into_iter()
+            .map(|plan| {
+                let (set, keys) = plan?;
+                let keys = keys
+                    .into_iter()
+                    .filter(|key| removed.insert(*key))
+                    .collect();
+                self.remove_planned(set, keys, policy)
+            })
+            .collect()
+    }
+
+    /// Removes `keys`, the systems that `interned` contained before this change began.
+    fn remove_planned(
+        &mut self,
+        interned: InternedSystemSet,
+        keys: IndexSet<SystemKey, FixedHasher>,
+        policy: ScheduleCleanupPolicy,
+    ) -> Result<usize, ScheduleError> {
         self.changed = true;
 
         match policy {
@@ -2902,6 +2953,58 @@ mod tests {
         assert!(result.is_ok());
         let conflicts = schedule.graph().conflicting_systems();
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn remove_several_sets_with_one_build() {
+        #[derive(Resource, Default)]
+        struct Ran(Vec<u8>);
+
+        fn system_1(mut ran: ResMut<Ran>) {
+            ran.0.push(1);
+        }
+        fn system_2(mut ran: ResMut<Ran>) {
+            ran.0.push(2);
+        }
+        fn system_3(mut ran: ResMut<Ran>) {
+            ran.0.push(3);
+        }
+        fn missing() {}
+
+        #[derive(Resource, Default)]
+        struct Builds(usize);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems((system_1, system_2, system_3).chain());
+        let mut world = World::new();
+        world.init_resource::<Ran>();
+        world.init_resource::<Builds>();
+        world.add_observer(
+            |_: crate::observer::On<super::ScheduleBuilt>, mut builds: ResMut<Builds>| {
+                builds.0 += 1;
+            },
+        );
+
+        let removed = schedule
+            .remove_systems_in_sets(
+                [
+                    system_1.into_system_set().intern(),
+                    system_3.into_system_set().intern(),
+                    system_1.into_system_set().intern(),
+                    missing.into_system_set().intern(),
+                ],
+                &mut world,
+                ScheduleCleanupPolicy::RemoveSystemsOnly,
+            )
+            .unwrap();
+        assert!(matches!(
+            removed.as_slice(),
+            [Ok(1), Ok(1), Ok(0), Err(super::ScheduleError::SetNotFound)]
+        ));
+        assert_eq!(world.resource::<Builds>().0, 1);
+
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<Ran>().0, [2]);
     }
 
     #[test]
