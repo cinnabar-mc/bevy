@@ -322,7 +322,7 @@ fn extract_screenshots(
 fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
-    window_surfaces: Query<(MainEntity, &SurfaceData)>,
+    window_surfaces: Query<(MainEntity, &ExtractedWindow, &SurfaceData)>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -336,11 +336,17 @@ fn prepare_screenshots(
         match target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
-                let Some((_, surface_data)) = window_surfaces.iter().find(|(e, _)| *e == window)
+                let Some((_, extracted, surface_data)) =
+                    window_surfaces.iter().find(|(e, _, _)| *e == window)
                 else {
                     warn!("Unknown window for screenshot, skipping: {}", window);
                     continue;
                 };
+                if !extracted.is_drawable(render_device.limits().max_texture_dimension_2d)
+                    || extracted.swap_chain_texture.is_none()
+                {
+                    continue;
+                }
                 let view_format = surface_data
                     .texture_view_format
                     .unwrap_or(surface_data.configuration.format);

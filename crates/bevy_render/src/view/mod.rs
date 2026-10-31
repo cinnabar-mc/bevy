@@ -1354,13 +1354,20 @@ pub fn clear_view_attachments(mut view_target_attachments: ResMut<ViewTargetAtta
 
 pub fn cleanup_view_targets_for_resize(
     mut commands: Commands,
-    windows: Query<(MainEntity, &ExtractedWindow)>,
+    windows: Query<(
+        MainEntity,
+        &ExtractedWindow,
+        Option<&crate::view::window::SurfaceData>,
+    )>,
     cameras: Query<(Entity, &ExtractedCamera), With<ViewTarget>>,
 ) {
     for (entity, camera) in &cameras {
         if let Some(NormalizedRenderTarget::Window(window_ref)) = &camera.target
-            && let Some((_, window)) = windows.iter().find(|(e, _)| *e == window_ref.entity())
-            && (window.size_changed || window.present_mode_changed)
+            && let Some((_, window, surface)) =
+                windows.iter().find(|(e, _, _)| *e == window_ref.entity())
+            && (window.size_changed
+                || window.present_mode_changed
+                || surface.is_some_and(crate::view::window::SurfaceData::needs_reconfiguration))
         {
             commands.entity(entity).remove::<ViewTarget>();
         }

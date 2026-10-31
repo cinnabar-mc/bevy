@@ -19,7 +19,11 @@ use wgpu::{
     SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+mod lifecycle;
 pub mod screenshot;
+
+pub use lifecycle::window_size_is_valid;
+use lifecycle::{replace_surface, SurfaceRecovery};
 
 use screenshot::ScreenshotPlugin;
 
@@ -89,6 +93,21 @@ pub struct ExtractedWindow {
 }
 
 impl ExtractedWindow {
+    /// Whether this window fits the device's render-target limits.
+    pub fn is_drawable(&self, max_texture_dimension_2d: u32) -> bool {
+        window_size_is_valid(
+            self.physical_width,
+            self.physical_height,
+            max_texture_dimension_2d,
+        )
+    }
+
+    /// Releases both retained handles before configuring or replacing a surface.
+    fn clear_swapchain_texture(&mut self) {
+        self.swap_chain_texture_view = None;
+        self.swap_chain_texture = None;
+    }
+
     fn set_swapchain_texture(&mut self, frame: wgpu::SurfaceTexture) {
         self.swap_chain_texture_view_format = Some(frame.texture.format().add_srgb_suffix());
         let texture_view_descriptor = TextureViewDescriptor {
@@ -131,8 +150,8 @@ fn extract_windows(
         }
 
         let (new_width, new_height) = (
-            window.resolution.physical_width().max(1),
-            window.resolution.physical_height().max(1),
+            window.resolution.physical_width(),
+            window.resolution.physical_height(),
         );
 
         let Ok(mut extracted_window) = extracted_windows.get_mut(render_entity) else {
@@ -229,15 +248,22 @@ wgpu_wrapper!(struct WgpuSurface(wgpu::Surface<'static>));
 
 #[derive(Component)]
 pub struct SurfaceData {
-    surface: WgpuSurface,
+    surface: Option<WgpuSurface>,
+    recovery: SurfaceRecovery,
     configuration: SurfaceConfiguration,
     texture_view_format: Option<TextureFormat>,
 }
 
 impl SurfaceData {
     /// The window's surface, for capability and display queries.
-    pub fn surface(&self) -> &wgpu::Surface<'static> {
-        &self.surface
+    /// Returns no surface while a failed recreation is waiting to be retried.
+    pub fn surface(&self) -> Option<&wgpu::Surface<'static>> {
+        self.surface.as_deref()
+    }
+
+    /// Whether retained views must be released before the next configuration.
+    pub fn needs_reconfiguration(&self) -> bool {
+        self.recovery.needs_configuration()
     }
 
     /// The configuration currently applied to the surface.
@@ -257,7 +283,9 @@ impl SurfaceData {
         self.configuration.format = format;
         self.configuration.color_space = color_space;
         self.configuration.view_formats = self.texture_view_format.into_iter().collect();
-        render_device.configure_surface(&self.surface, &self.configuration);
+        if let Some(surface) = self.surface() {
+            render_device.configure_surface(surface, &self.configuration);
+        }
     }
 }
 
@@ -288,12 +316,16 @@ fn srgb_view_format(format: TextureFormat) -> Option<TextureFormat> {
 ///   [`Backends::GL`](crate::settings::Backends::GL) with the `gles` feature enabled if your
 ///   GPU/drivers support `OpenGL 4.3` / `OpenGL ES 3.0` or later.
 pub fn prepare_windows(
-    mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&SurfaceData>)>,
+    mut windows: Query<(MainEntity, &mut ExtractedWindow, Option<&mut SurfaceData>)>,
     render_device: Res<RenderDevice>,
     sorted_cameras: Res<crate::camera::SortedCameras>,
     #[cfg(target_os = "linux")] render_instance: Res<RenderInstance>,
 ) {
     for (main_entity, mut window, maybe_surface_data) in &mut windows {
+        if !window.is_drawable(render_device.limits().max_texture_dimension_2d) {
+            window.clear_swapchain_texture();
+            continue;
+        }
         // Skip acquiring a swap-chain texture for windows that no camera
         // targets. This avoids a wasted clear pass in
         // `handle_uncovered_swap_chains` that triggers a DMA-fence fd leak on
@@ -309,9 +341,12 @@ pub fn prepare_windows(
             continue;
         }
 
-        let Some(surface_data) = maybe_surface_data else {
+        let Some(mut surface_data) = maybe_surface_data else {
             continue;
         };
+        if surface_data.needs_reconfiguration() || surface_data.surface.is_none() {
+            continue;
+        }
 
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
         if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
@@ -343,8 +378,16 @@ pub fn prepare_windows(
             })[0]
         };
 
-        let surface = &surface_data.surface;
-        match surface.get_current_texture() {
+        // Acquisition already reports Validation in its result. Capture that error here so
+        // the uncaptured-error handler does not stop rendering before repair can run.
+        // Dropping the guard pops it without waiting on a GPU or browser promise.
+        let validation = render_device
+            .wgpu_device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let result = surface_data.surface().unwrap().get_current_texture();
+        drop(validation);
+        surface_data.recovery.observe(&result);
+        match result {
             wgpu::CurrentSurfaceTexture::Success(surface_texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
                 window.set_swapchain_texture(surface_texture);
@@ -356,21 +399,12 @@ pub fn prepare_windows(
                         of your Linux GPU driver, so it can be safely ignored."
                 );
             }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                render_device.configure_surface(surface, &surface_data.configuration);
-                let frame = match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(surface_texture)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => surface_texture,
-                    variant => {
-                        // This is a common occurrence on X11 and Xwayland with NVIDIA drivers
-                        // when opening and resizing the window.
-                        warn!(
-                            "Couldn't get swap chain texture after configuring. Cause: '{variant:?}'"
-                        );
-                        continue;
-                    }
-                };
-                window.set_swapchain_texture(frame);
+            wgpu::CurrentSurfaceTexture::Outdated => window.clear_swapchain_texture(),
+            result @ (wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation) => {
+                // Recovery runs next frame, after attachments and camera outputs are released.
+                warn!("Surface acquisition failed; scheduling repair: {result:?}");
+                window.clear_swapchain_texture();
             }
             wgpu::CurrentSurfaceTexture::Occluded => {}
             other => {
@@ -381,9 +415,16 @@ pub fn prepare_windows(
     }
 }
 
-pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceData>)>) -> bool {
-    for (window, has_surface_data) in &windows {
-        if !has_surface_data || window.size_changed || window.present_mode_changed {
+pub fn need_surface_configuration(
+    windows: Query<(&ExtractedWindow, Option<&SurfaceData>)>,
+    render_device: Res<RenderDevice>,
+) -> bool {
+    for (window, surface) in &windows {
+        if window.is_drawable(render_device.limits().max_texture_dimension_2d)
+            && (surface.is_none_or(SurfaceData::needs_reconfiguration)
+                || window.size_changed
+                || window.present_mode_changed)
+        {
             return true;
         }
     }
@@ -413,6 +454,10 @@ pub fn create_surfaces(
     render_device: Res<RenderDevice>,
 ) {
     for (entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+        if !window.is_drawable(render_device.limits().max_texture_dimension_2d) {
+            window.clear_swapchain_texture();
+            continue;
+        }
         let Some(data) = maybe_surface_data.as_mut() else {
             let surface_target = SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: Some(handle.get_display_handle()),
@@ -471,28 +516,39 @@ pub fn create_surfaces(
             render_device.configure_surface(&surface, &configuration);
 
             commands.entity(entity).insert(SurfaceData {
-                surface: WgpuSurface::new(surface),
+                surface: Some(WgpuSurface::new(surface)),
+                recovery: SurfaceRecovery::default(),
                 configuration,
                 texture_view_format,
             });
             continue;
         };
 
-        if window.size_changed || window.present_mode_changed {
-            // normally this is dropped on present but we double check here to be safe as failure to
-            // drop it will cause validation errors in wgpu
-            drop(window.swap_chain_texture.take());
-            #[cfg_attr(
-                target_arch = "wasm32",
-                expect(clippy::drop_non_drop, reason = "texture views are not drop on wasm")
-            )]
-            drop(window.swap_chain_texture_view.take());
-
+        if window.size_changed || window.present_mode_changed || data.needs_reconfiguration() {
+            window.clear_swapchain_texture();
+            if data.recovery.needs_recreation() {
+                let result = replace_surface(&mut data.surface, || {
+                    // SAFETY: The extracted handle remains valid, and this system runs on the
+                    // main thread on platforms that require surface creation there.
+                    unsafe {
+                        render_instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
+                            raw_display_handle: Some(handle.get_display_handle()),
+                            raw_window_handle: handle.get_window_handle(),
+                        })
+                    }
+                    .map(WgpuSurface::new)
+                });
+                if let Err(error) = result {
+                    warn!("Couldn't recreate window surface: {error}");
+                    continue;
+                }
+            }
             data.configuration.width = window.physical_width;
             data.configuration.height = window.physical_height;
-            let caps = data.surface.get_capabilities(&render_adapter);
+            let caps = data.surface().unwrap().get_capabilities(&render_adapter);
             data.configuration.present_mode = present_mode(&window, &caps);
-            render_device.configure_surface(&data.surface, &data.configuration);
+            render_device.configure_surface(data.surface().unwrap(), &data.configuration);
+            data.recovery.configured();
         }
     }
 }
