@@ -23,7 +23,7 @@ mod lifecycle;
 pub mod screenshot;
 
 pub use lifecycle::window_size_is_valid;
-use lifecycle::{replace_surface, SurfaceRecovery};
+use lifecycle::{present_frame, replace_surface, SurfaceRecovery};
 
 use screenshot::ScreenshotPlugin;
 
@@ -125,13 +125,11 @@ impl ExtractedWindow {
     }
 
     pub fn present(&mut self, queue: &RenderQueue) {
-        if let Some(surface_texture) = self.swap_chain_texture.take() {
-            // TODO(clean): winit docs recommends calling pre_present_notify before this.
-            // though `present()` doesn't present the frame, it schedules it to be presented
-            // by wgpu.
-            // https://docs.rs/winit/0.29.9/wasm32-unknown-unknown/winit/window/struct.Window.html#method.pre_present_notify
-            surface_texture.present(queue);
-        }
+        present_frame(
+            self.swap_chain_texture.take(),
+            &mut self.needs_initial_present,
+            |surface_texture| surface_texture.present(queue),
+        );
     }
 }
 

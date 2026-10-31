@@ -121,7 +121,6 @@ pub fn render_system(
 
                 if view_needs_present || window.needs_initial_present {
                     window.present(&render_queue);
-                    window.needs_initial_present = false;
                 }
             }
         }

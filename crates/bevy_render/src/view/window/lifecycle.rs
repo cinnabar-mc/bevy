@@ -71,10 +71,35 @@ pub(super) fn replace_surface<T, E>(
     Ok(())
 }
 
+/// Consumes the initial-present requirement only when a drawable is actually submitted.
+pub(super) fn present_frame<T>(
+    frame: Option<T>,
+    needs_initial_present: &mut bool,
+    present: impl FnOnce(T),
+) {
+    if let Some(frame) = frame {
+        present(frame);
+        *needs_initial_present = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+
+    #[test]
+    fn initial_present_survives_suspension_until_a_drawable_is_submitted() {
+        let mut initial = true;
+        present_frame::<()>(None, &mut initial, |_| {
+            panic!("no drawable while suspended")
+        });
+        assert!(initial);
+        let mut submitted = false;
+        present_frame(Some(()), &mut initial, |_| submitted = true);
+        assert!(submitted);
+        assert!(!initial);
+    }
 
     #[test]
     fn rejects_impossible_sizes_and_accepts_the_next_legal_resize() {

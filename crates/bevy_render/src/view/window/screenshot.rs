@@ -269,6 +269,7 @@ pub fn trigger_screenshots(
 
 fn extract_screenshots(
     mut targets: ResMut<RenderScreenshotTargets>,
+    prepared: Res<RenderScreenshotsPrepared>,
     mut main_world: ResMut<MainWorld>,
     mut system_state: Local<
         Option<
@@ -281,6 +282,15 @@ fn extract_screenshots(
     >,
     mut seen_targets: Local<HashSet<NormalizedRenderTarget>>,
 ) {
+    // A suspended window or failed acquisition may have prevented preparation last frame.
+    // Give those requests back to extraction instead of leaving them in Capturing forever.
+    for entity in targets.keys() {
+        if !prepared.contains_key(entity)
+            && let Ok(mut request) = main_world.get_entity_mut(*entity)
+        {
+            request.remove::<Capturing>();
+        }
+    }
     if system_state.is_none() {
         *system_state = Some(SystemState::new(&mut main_world));
     }
@@ -769,5 +779,40 @@ pub(crate) fn collect_screenshots(world: &mut World) {
         };
 
         AsyncComputeTaskPool::get().spawn(finish).detach();
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    #[test]
+    fn unprepared_screenshot_is_extracted_again_after_a_suspended_frame() {
+        let mut main = MainWorld::default();
+        let window = main.spawn_empty().id();
+        let request = main.spawn(Screenshot::window(window)).id();
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderScreenshotTargets>();
+        world.init_resource::<RenderScreenshotsPrepared>();
+        let mut extraction = Schedule::default();
+        extraction.add_systems(extract_screenshots);
+        for _ in 0..3 {
+            extraction.run(&mut world);
+            assert!(world
+                .resource::<RenderScreenshotTargets>()
+                .contains_key(&request));
+            assert!(world
+                .resource::<MainWorld>()
+                .get::<Capturing>(request)
+                .is_some());
+        }
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(request)
+            .despawn();
+        world.run_system_once(extract_screenshots).unwrap();
+        assert!(world.resource::<RenderScreenshotTargets>().is_empty());
     }
 }
