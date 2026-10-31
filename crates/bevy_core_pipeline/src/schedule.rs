@@ -28,7 +28,10 @@ use bevy_render::{
         CommandEncoderDescriptor, LoadOp, Operations, RenderPassColorAttachment,
         RenderPassDescriptor, StoreOp,
     },
-    renderer::{CurrentView, PendingCommandBuffers, RenderDevice, RenderQueue},
+    renderer::{
+        run_render_schedule, CurrentView, PendingCommandBuffers, RenderDevice, RenderQueue,
+        SerialRenderExecutor,
+    },
     sync_world::MainEntity,
     view::ExtractedWindow,
 };
@@ -60,6 +63,8 @@ impl Core3d {
         use Core3dSystems::*;
 
         let mut schedule = Schedule::new(Self);
+        // Systems run one at a time and share the frame's command encoder.
+        schedule.set_executor(SerialRenderExecutor::new());
 
         schedule.set_build_settings(ScheduleBuildSettings {
             auto_insert_apply_deferred: false,
@@ -99,6 +104,8 @@ impl Core2d {
         use Core2dSystems::*;
 
         let mut schedule = Schedule::new(Self);
+        // Systems run one at a time and share the frame's command encoder.
+        schedule.set_executor(SerialRenderExecutor::new());
 
         schedule.set_build_settings(ScheduleBuildSettings {
             auto_insert_apply_deferred: false,
@@ -129,8 +136,8 @@ pub struct RootNonCameraView(#[reflect(ignore)] pub InternedScheduleLabel);
 /// schedule. This system iterates over all cameras in the world, executing their associated
 /// rendering schedules defined by the [`bevy_render::camera::CameraRenderGraph`] component.
 ///
-/// After executing all camera schedules, it submits any pending command buffers to the GPU
-/// and clears any swap chains that were not covered by a camera. Users can order any additional
+/// After all camera schedules have run, swap chains that were not covered by a camera are cleared
+/// and every pending command buffer is submitted to the GPU at once. Users can order any additional
 /// operations (e.g. one-off compute passes) before or after this system in the root render
 /// graph schedule.
 pub fn camera_driver(
@@ -235,7 +242,7 @@ pub fn camera_driver(
             let _span =
                 bevy_log::info_span!("camera_schedule", camera = root_view.to_string()).entered();
 
-            world.run_schedule(schedule);
+            run_render_schedule(world, schedule);
         }
     }
     if diagnostics_enabled && !reached_root_camera {
@@ -307,34 +314,30 @@ pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
         return;
     }
 
-    let render_device = world.resource::<RenderDevice>();
-    let render_queue = world.resource::<RenderQueue>();
+    world.resource_scope(|world, mut pending: Mut<PendingCommandBuffers>| {
+        let encoder = pending.command_encoder(world.resource::<RenderDevice>());
+        for (swap_chain_texture, clear_color) in &windows_to_clear {
+            #[cfg(feature = "trace")]
+            let _span = bevy_log::info_span!("no_camera_clear_pass").entered();
 
-    let mut encoder = render_device.create_command_encoder(&CommandEncoderDescriptor::default());
+            let pass_descriptor = RenderPassDescriptor {
+                label: Some("no_camera_clear_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: swap_chain_texture,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear((*clear_color).into()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            };
 
-    for (swap_chain_texture, clear_color) in &windows_to_clear {
-        #[cfg(feature = "trace")]
-        let _span = bevy_log::info_span!("no_camera_clear_pass").entered();
-
-        let pass_descriptor = RenderPassDescriptor {
-            label: Some("no_camera_clear_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: swap_chain_texture,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Clear((*clear_color).into()),
-                    store: StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        };
-
-        encoder.begin_render_pass(&pass_descriptor);
-    }
-
-    render_queue.submit([encoder.finish()]);
+            encoder.begin_render_pass(&pass_descriptor);
+        }
+    });
 }
