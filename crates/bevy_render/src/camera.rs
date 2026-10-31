@@ -471,6 +471,7 @@ pub struct ExtractedCamera {
 }
 
 pub fn extract_cameras(
+    render_device: Res<crate::renderer::RenderDevice>,
     mut commands: Commands,
     mut main_pass_formats: ResMut<CameraMainPassTextureFormats>,
     query: Extract<
@@ -565,7 +566,11 @@ pub fn extract_cameras(
             camera.physical_viewport_size(),
             camera.physical_target_size(),
         ) {
-            if target_size.x == 0 || target_size.y == 0 {
+            if !crate::view::window::window_size_is_valid(
+                target_size.x,
+                target_size.y,
+                render_device.limits().max_texture_dimension_2d,
+            ) {
                 commands
                     .entity(render_entity)
                     .remove::<ExtractedCameraComponents>();

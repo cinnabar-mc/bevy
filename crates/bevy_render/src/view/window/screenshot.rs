@@ -14,7 +14,7 @@ use crate::{
     },
     ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
 };
-use alloc::{borrow::Cow, sync::Arc};
+use alloc::{borrow::Cow, collections::VecDeque, sync::Arc};
 use bevy_app::{First, Plugin, Update};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle, RenderAssetUsages};
 use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget};
@@ -269,6 +269,7 @@ pub fn trigger_screenshots(
 
 fn extract_screenshots(
     mut targets: ResMut<RenderScreenshotTargets>,
+    prepared: Res<RenderScreenshotsPrepared>,
     mut main_world: ResMut<MainWorld>,
     mut system_state: Local<
         Option<
@@ -280,7 +281,13 @@ fn extract_screenshots(
         >,
     >,
     mut seen_targets: Local<HashSet<NormalizedRenderTarget>>,
+    mut pending: Local<VecDeque<(Entity, NormalizedRenderTarget)>>,
 ) {
+    // Submitted requests belong to asynchronous readback; canceled requests no longer own
+    // observers. All other requests retain their place until preparation succeeds.
+    pending.retain(|(entity, _)| {
+        !prepared.contains_key(entity) && main_world.get::<Screenshot>(*entity).is_some()
+    });
     if system_state.is_none() {
         *system_state = Some(SystemState::new(&mut main_world));
     }
@@ -302,18 +309,15 @@ fn extract_screenshots(
             );
             continue;
         };
-        if seen_targets.contains(&render_target) {
-            warn!(
-                "Duplicate render target for screenshot, skipping entity {}: {:?}",
-                entity, render_target
-            );
-            // If we don't despawn the entity here, it will be captured again in the next frame
-            commands.entity(entity).despawn();
-            continue;
-        }
-        seen_targets.insert(render_target.clone());
-        targets.insert(entity, render_target);
+        pending.push_back((entity, render_target));
         commands.entity(entity).insert(Capturing);
+    }
+
+    // Serve one request per target in arrival order, independent of ECS table row changes.
+    for (entity, target) in pending.iter() {
+        if seen_targets.insert(target.clone()) {
+            targets.insert(*entity, target.clone());
+        }
     }
 
     system_state.apply(&mut main_world);
@@ -322,7 +326,7 @@ fn extract_screenshots(
 fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
-    window_surfaces: Query<(MainEntity, &SurfaceData)>,
+    window_surfaces: Query<(MainEntity, &ExtractedWindow, &SurfaceData)>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -336,11 +340,17 @@ fn prepare_screenshots(
         match target {
             NormalizedRenderTarget::Window(window) => {
                 let window = window.entity();
-                let Some((_, surface_data)) = window_surfaces.iter().find(|(e, _)| *e == window)
+                let Some((_, extracted, surface_data)) =
+                    window_surfaces.iter().find(|(e, _, _)| *e == window)
                 else {
                     warn!("Unknown window for screenshot, skipping: {}", window);
                     continue;
                 };
+                if !extracted.is_drawable(render_device.limits().max_texture_dimension_2d)
+                    || extracted.swap_chain_texture.is_none()
+                {
+                    continue;
+                }
                 let view_format = surface_data
                     .texture_view_format
                     .unwrap_or(surface_data.configuration.format);
@@ -763,5 +773,128 @@ pub(crate) fn collect_screenshots(world: &mut World) {
         };
 
         AsyncComputeTaskPool::get().spawn(finish).detach();
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    #[test]
+    fn a_new_screenshot_does_not_discard_a_request_waiting_for_recovery() {
+        let mut main = MainWorld::default();
+        let window = main.spawn_empty().id();
+        let first = main.spawn(Screenshot::window(window)).id();
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderScreenshotTargets>();
+        world.init_resource::<RenderScreenshotsPrepared>();
+        let mut extraction = Schedule::default();
+        extraction.add_systems(extract_screenshots);
+        extraction.run(&mut world);
+        let second = world
+            .resource_mut::<MainWorld>()
+            .spawn(Screenshot::window(window))
+            .id();
+        extraction.run(&mut world);
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Screenshot>(first)
+            .is_some());
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Screenshot>(second)
+            .is_some());
+        let submitted = *world
+            .resource::<RenderScreenshotTargets>()
+            .keys()
+            .next()
+            .unwrap();
+        let waiting = if submitted == first { second } else { first };
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Capturing>(waiting)
+            .is_some());
+        // Completion removes the submitted request; the other must remain eligible.
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(submitted)
+            .despawn();
+        extraction.run(&mut world);
+        assert!(world
+            .resource::<RenderScreenshotTargets>()
+            .contains_key(&waiting));
+    }
+
+    #[test]
+    fn older_screenshots_progress_while_new_requests_keep_arriving() {
+        let mut main = MainWorld::default();
+        let window = main.spawn_empty().id();
+        let first = main.spawn(Screenshot::window(window)).id();
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderScreenshotTargets>();
+        world.init_resource::<RenderScreenshotsPrepared>();
+        let mut extraction = Schedule::default();
+        extraction.add_systems(extract_screenshots);
+        extraction.run(&mut world);
+        let second = world
+            .resource_mut::<MainWorld>()
+            .spawn(Screenshot::window(window))
+            .id();
+        extraction.run(&mut world);
+        assert!(world
+            .resource::<RenderScreenshotTargets>()
+            .contains_key(&first));
+        let mut expected = VecDeque::from([first, second]);
+        for _ in 0..8 {
+            let new = world
+                .resource_mut::<MainWorld>()
+                .spawn(Screenshot::window(window))
+                .id();
+            expected.push_back(new);
+            extraction.run(&mut world);
+            let selected = *world
+                .resource::<RenderScreenshotTargets>()
+                .keys()
+                .next()
+                .unwrap();
+            assert_eq!(Some(selected), expected.pop_front());
+            // Model completion removing its request while new requests keep arriving.
+            world
+                .resource_mut::<MainWorld>()
+                .entity_mut(selected)
+                .despawn();
+        }
+    }
+
+    #[test]
+    fn unprepared_screenshot_is_extracted_again_after_a_suspended_frame() {
+        let mut main = MainWorld::default();
+        let window = main.spawn_empty().id();
+        let request = main.spawn(Screenshot::window(window)).id();
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderScreenshotTargets>();
+        world.init_resource::<RenderScreenshotsPrepared>();
+        let mut extraction = Schedule::default();
+        extraction.add_systems(extract_screenshots);
+        for _ in 0..3 {
+            extraction.run(&mut world);
+            assert!(world
+                .resource::<RenderScreenshotTargets>()
+                .contains_key(&request));
+            assert!(world
+                .resource::<MainWorld>()
+                .get::<Capturing>(request)
+                .is_some());
+        }
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(request)
+            .despawn();
+        world.run_system_once(extract_screenshots).unwrap();
+        assert!(world.resource::<RenderScreenshotTargets>().is_empty());
     }
 }
