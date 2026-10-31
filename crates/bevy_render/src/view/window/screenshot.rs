@@ -313,12 +313,8 @@ fn extract_screenshots(
             continue;
         };
         if seen_targets.contains(&render_target) {
-            warn!(
-                "Duplicate render target for screenshot, skipping entity {}: {:?}",
-                entity, render_target
-            );
-            // If we don't despawn the entity here, it will be captured again in the next frame
-            commands.entity(entity).despawn();
+            // A previous request may have waited for surface recovery. Keep each request's
+            // observer alive and let extraction retry duplicates after the first is submitted.
             continue;
         }
         seen_targets.insert(render_target.clone());
@@ -786,6 +782,52 @@ pub(crate) fn collect_screenshots(world: &mut World) {
 mod recovery_tests {
     use super::*;
     use bevy_ecs::system::RunSystemOnce;
+
+    #[test]
+    fn a_new_screenshot_does_not_discard_a_request_waiting_for_recovery() {
+        let mut main = MainWorld::default();
+        let window = main.spawn_empty().id();
+        let first = main.spawn(Screenshot::window(window)).id();
+        let mut world = World::new();
+        world.insert_resource(main);
+        world.init_resource::<RenderScreenshotTargets>();
+        world.init_resource::<RenderScreenshotsPrepared>();
+        let mut extraction = Schedule::default();
+        extraction.add_systems(extract_screenshots);
+        extraction.run(&mut world);
+        let second = world
+            .resource_mut::<MainWorld>()
+            .spawn(Screenshot::window(window))
+            .id();
+        extraction.run(&mut world);
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Screenshot>(first)
+            .is_some());
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Screenshot>(second)
+            .is_some());
+        let submitted = *world
+            .resource::<RenderScreenshotTargets>()
+            .keys()
+            .next()
+            .unwrap();
+        let waiting = if submitted == first { second } else { first };
+        assert!(world
+            .resource::<MainWorld>()
+            .get::<Capturing>(waiting)
+            .is_none());
+        // Completion removes the submitted request; the other must remain eligible.
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(submitted)
+            .despawn();
+        extraction.run(&mut world);
+        assert!(world
+            .resource::<RenderScreenshotTargets>()
+            .contains_key(&waiting));
+    }
 
     #[test]
     fn unprepared_screenshot_is_extracted_again_after_a_suspended_frame() {
