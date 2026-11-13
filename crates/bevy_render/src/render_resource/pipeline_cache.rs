@@ -156,35 +156,76 @@ fn load_module(
         source: shader_source,
     };
 
+    // A backend that compiles at module creation reports its compiler's failure as an internal
+    // error. The pipeline then fails for the driver's reason, not for the shader's, so the
+    // application sees the one variant it may retry.
+    catch_driver_failure(render_device, || {
+        let scope = render_device
+            .wgpu_device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let shader_module = WgpuShaderModule::new(match validate_shader {
+            ValidateShader::Enabled => {
+                render_device.create_and_validate_shader_module(module_descriptor)
+            }
+            // SAFETY: we are interfacing with shader code, which may contain undefined behavior,
+            // such as indexing out of bounds.
+            // The checks required are prohibitively expensive and a poor default for game engines.
+            ValidateShader::Disabled => unsafe {
+                render_device.create_shader_module(module_descriptor)
+            },
+        });
+
+        let error = scope.pop();
+
+        // `now_or_never` will return Some if the future is ready and None otherwise.
+        // On native platforms, wgpu will yield the error immediately while on wasm it may take longer since the browser APIs are asynchronous.
+        // So to keep the complexity of the ShaderCache low, we will only catch this error early on native platforms,
+        // and on wasm the error will be handled by wgpu and crash the application.
+        if let Some(Some(wgpu::Error::Validation { description, .. })) =
+            bevy_tasks::futures::now_or_never(error)
+        {
+            return Err(ShaderCacheError::CreateShaderModule(description));
+        }
+
+        Ok(shader_module)
+    })
+    .map_err(ShaderCacheError::CreatePipeline)?
+}
+
+/// Runs `create` and returns the description of the internal error the driver raised for it,
+/// so a pipeline or module the driver failed to build becomes a terminal [`ShaderCacheError`]
+/// instead of reaching the uncaptured-error handler while the cache keeps the invalid object
+/// as ready. Validation and out-of-memory errors are not captured.
+///
+/// Error scopes belong to the calling thread, and `create` runs to completion between the push
+/// and the pop, so this also holds on a task-pool worker: a pipeline task has no await point at
+/// which it could move to another thread. wgpu's native backends resolve a popped scope
+/// immediately. In the browser the scope cannot be read without yielding, so no scope is pushed
+/// there and the error stays uncaptured, as before.
+fn catch_driver_failure<T>(
+    render_device: &RenderDevice,
+    create: impl FnOnce() -> T,
+) -> Result<T, String> {
+    if cfg!(target_arch = "wasm32") {
+        return Ok(create());
+    }
     let scope = render_device
         .wgpu_device()
-        .push_error_scope(wgpu::ErrorFilter::Validation);
-
-    let shader_module = WgpuShaderModule::new(match validate_shader {
-        ValidateShader::Enabled => {
-            render_device.create_and_validate_shader_module(module_descriptor)
-        }
-        // SAFETY: we are interfacing with shader code, which may contain undefined behavior,
-        // such as indexing out of bounds.
-        // The checks required are prohibitively expensive and a poor default for game engines.
-        ValidateShader::Disabled => unsafe {
-            render_device.create_shader_module(module_descriptor)
-        },
-    });
-
-    let error = scope.pop();
-
-    // `now_or_never` will return Some if the future is ready and None otherwise.
-    // On native platforms, wgpu will yield the error immediately while on wasm it may take longer since the browser APIs are asynchronous.
-    // So to keep the complexity of the ShaderCache low, we will only catch this error early on native platforms,
-    // and on wasm the error will be handled by wgpu and crash the application.
-    if let Some(Some(wgpu::Error::Validation { description, .. })) =
-        bevy_tasks::futures::now_or_never(error)
-    {
-        return Err(ShaderCacheError::CreateShaderModule(description));
+        .push_error_scope(wgpu::ErrorFilter::Internal);
+    let created = create();
+    match driver_failure(bevy_tasks::futures::now_or_never(scope.pop())) {
+        Some(description) => Err(description),
+        None => Ok(created),
     }
+}
 
-    Ok(shader_module)
+/// The description of the internal error a popped scope captured, if it resolved with one.
+fn driver_failure(popped: Option<Option<wgpu::Error>>) -> Option<String> {
+    match popped {
+        Some(Some(wgpu::Error::Internal { description, .. })) => Some(description),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -414,6 +455,9 @@ impl PipelineCache {
     }
 
     /// Wait for a render pipeline to finish compiling.
+    ///
+    /// Returns once the pipeline is no longer compiling, whether it succeeded or failed; a
+    /// failed pipeline stays in [`CachedPipelineState::Err`] and this does not wait for it again.
     #[inline]
     pub fn block_on_render_pipeline(&mut self, id: CachedRenderPipelineId) {
         if self.pipelines.len() <= id.id() {
@@ -427,6 +471,26 @@ impl PipelineCache {
                 Err(e) => CachedPipelineState::Err(e),
             };
         }
+    }
+
+    /// Queues another attempt at a pipeline that ended in [`ShaderCacheError::CreatePipeline`].
+    ///
+    /// The cache never retries such a pipeline by itself, because the same driver usually fails
+    /// the same way. Returns `false` and changes nothing when the pipeline is in any other
+    /// state or `id` is unknown.
+    pub fn retry_failed_pipeline(&mut self, id: CachedPipelineId) -> bool {
+        let Some(pipeline) = self.pipelines.get_mut(id) else {
+            return false;
+        };
+        if !matches!(
+            pipeline.state,
+            CachedPipelineState::Err(ShaderCacheError::CreatePipeline(_))
+        ) {
+            return false;
+        }
+        pipeline.state = CachedPipelineState::Queued;
+        self.waiting_pipelines.insert(id);
+        true
     }
 
     /// Try to retrieve a compute pipeline GPU object from a cached ID.
@@ -679,9 +743,9 @@ impl PipelineCache {
                     cache: pipeline_cache.as_deref(),
                 };
 
-                Ok(Pipeline::RenderPipeline(
-                    device.create_render_pipeline(&descriptor),
-                ))
+                catch_driver_failure(&device, || device.create_render_pipeline(&descriptor))
+                    .map(Pipeline::RenderPipeline)
+                    .map_err(ShaderCacheError::CreatePipeline)
             },
             self.synchronous_pipeline_compilation,
             self.async_pipeline_compilation_on_macos,
@@ -743,9 +807,9 @@ impl PipelineCache {
                     cache: pipeline_cache.as_deref(),
                 };
 
-                Ok(Pipeline::ComputePipeline(
-                    device.create_compute_pipeline(&descriptor),
-                ))
+                catch_driver_failure(&device, || device.create_compute_pipeline(&descriptor))
+                    .map(Pipeline::ComputePipeline)
+                    .map_err(ShaderCacheError::CreatePipeline)
             },
             self.synchronous_pipeline_compilation,
             self.async_pipeline_compilation_on_macos,
@@ -883,9 +947,9 @@ impl PipelineCache {
                     cache: pipeline_cache.as_deref(),
                 };
 
-                Ok(Pipeline::MeshPipeline(
-                    device.create_mesh_pipeline(&descriptor),
-                ))
+                catch_driver_failure(&device, || device.create_mesh_pipeline(&descriptor))
+                    .map(Pipeline::MeshPipeline)
+                    .map_err(ShaderCacheError::CreatePipeline)
             },
             self.synchronous_pipeline_compilation,
             self.async_pipeline_compilation_on_macos,
@@ -966,6 +1030,11 @@ impl PipelineCache {
                 }
                 ShaderCacheError::CreateShaderModule(description) => {
                     error!("failed to create shader module: {}", description);
+                    return;
+                }
+                // The driver refused valid input; the application decides whether to retry.
+                ShaderCacheError::CreatePipeline(description) => {
+                    error!("failed to create pipeline: {}", description);
                     return;
                 }
             },
