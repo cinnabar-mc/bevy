@@ -542,7 +542,8 @@ pub enum ShaderCacheError {
     ShaderImportNotYetAvailable,
     #[error("Could not create shader module: {0}")]
     CreateShaderModule(String),
-    /// The driver failed to build the pipeline from valid input. The cache does not retry it.
+    /// The driver failed to build the pipeline, or a shader module it uses, from valid input.
+    /// The cache does not retry it.
     #[error("Could not create pipeline: {0}")]
     CreatePipeline(String),
 }

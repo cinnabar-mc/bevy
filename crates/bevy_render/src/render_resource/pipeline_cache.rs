@@ -157,7 +157,8 @@ fn load_module(
     };
 
     // A backend that compiles at module creation reports its compiler's failure as an internal
-    // error.
+    // error. The pipeline then fails for the driver's reason, not for the shader's, so the
+    // application sees the one variant it may retry.
     catch_driver_failure(render_device, || {
         let scope = render_device
             .wgpu_device()
@@ -189,7 +190,7 @@ fn load_module(
 
         Ok(shader_module)
     })
-    .map_err(ShaderCacheError::CreateShaderModule)?
+    .map_err(ShaderCacheError::CreatePipeline)?
 }
 
 /// Runs `create` and returns the description of the internal error the driver raised for it,
