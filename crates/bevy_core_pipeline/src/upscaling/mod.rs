@@ -37,6 +37,14 @@ impl Plugin for UpscalingPlugin {
 #[derive(Component)]
 pub struct ViewUpscalingPipeline(CachedRenderPipelineId, BlitPipelineKey);
 
+impl ViewUpscalingPipeline {
+    /// The cached blit pipeline this view presents with, so an application can tell when a
+    /// view has nothing to present because that pipeline failed.
+    pub fn pipeline_id(&self) -> CachedRenderPipelineId {
+        self.0
+    }
+}
+
 /// This is not required on first startup but is required during render recovery
 fn clear_view_upscaling_pipelines(
     mut commands: Commands,
