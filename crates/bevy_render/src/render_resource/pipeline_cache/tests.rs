@@ -1,4 +1,5 @@
-//! Exercises real descriptors through the optional driver cache and worker executor.
+//! Exercises real descriptors through the optional driver cache and worker executor, and the
+//! terminal state of a pipeline the driver failed to build.
 
 use super::*;
 
@@ -162,4 +163,128 @@ fn native_driver_cache_and_worker_compilation() {
         );
     }
     cache.set_pipeline_cache(None);
+}
+
+/// A cache on the noop backend that compiles on the caller, with one queued render pipeline.
+fn noop_cache() -> (wgpu::Device, PipelineCache, CachedRenderPipelineId) {
+    let (device, _queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+    let mut cache = PipelineCache::new(RenderDevice::from(device.clone()), true);
+    let shader = Handle::<Shader>::default();
+    cache.set_shader(
+        shader.id(),
+        Shader::from_wgsl(SOURCE, "pipeline-failure-test.wgsl"),
+    );
+    let render = cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("failure test".into()),
+        vertex: VertexState {
+            shader: shader.clone(),
+            entry_point: Some("vertex".into()),
+            ..Default::default()
+        },
+        fragment: Some(FragmentState {
+            shader,
+            entry_point: Some("fragment".into()),
+            targets: vec![Some(TextureFormat::Rgba8Unorm.into())],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    (device, cache, render)
+}
+
+/// A driver failure stays an error without being polled or waited for again, and compiles
+/// again only when the application asks.
+#[test]
+fn a_driver_failure_is_terminal_until_the_application_retries() {
+    let (_device, mut cache, render) = noop_cache();
+    cache.process_queue();
+    assert!(cache.get_render_pipeline(render).is_some());
+    assert!(
+        !cache.retry_failed_pipeline(render.id()),
+        "a ready pipeline must not be recompiled"
+    );
+    assert!(!cache.retry_failed_pipeline(render.id() + 1));
+
+    cache.pipelines[render.id()].state =
+        CachedPipelineState::Err(ShaderCacheError::CreatePipeline("driver refused".into()));
+    cache.waiting_pipelines.insert(render.id());
+    for _ in 0..3 {
+        cache.process_queue();
+        cache.block_on_render_pipeline(render);
+    }
+    assert!(matches!(
+        cache.get_render_pipeline_state(render),
+        CachedPipelineState::Err(ShaderCacheError::CreatePipeline(description))
+            if description == "driver refused"
+    ));
+    assert!(cache.get_render_pipeline(render).is_none());
+    assert_eq!(cache.waiting_pipelines().count(), 0);
+
+    assert!(cache.retry_failed_pipeline(render.id()));
+    cache.process_queue();
+    assert!(cache.get_render_pipeline(render).is_some());
+}
+
+/// Only an internal error the scope already resolved counts; anything else leaves the
+/// created object in use.
+#[test]
+fn only_a_resolved_internal_error_is_a_driver_failure() {
+    let internal = wgpu::Error::Internal {
+        source: "driver".into(),
+        description: "vkCreateGraphicsPipelines failed".into(),
+    };
+    assert_eq!(
+        driver_failure(Some(Some(internal))).as_deref(),
+        Some("vkCreateGraphicsPipelines failed")
+    );
+    let validation = wgpu::Error::Validation {
+        source: "caller".into(),
+        description: "bad descriptor".into(),
+    };
+    assert_eq!(driver_failure(Some(Some(validation))), None);
+    let out_of_memory = wgpu::Error::OutOfMemory {
+        source: "allocator".into(),
+    };
+    assert_eq!(driver_failure(Some(Some(out_of_memory))), None);
+    assert_eq!(driver_failure(Some(None)), None);
+    assert_eq!(driver_failure(None), None);
+}
+
+/// On a worker thread the internal scope returns the created value, leaves a validation error
+/// to the caller's own scope, and is popped before that scope.
+#[test]
+fn the_internal_scope_passes_other_errors_to_the_enclosing_scope() {
+    let (device, _cache, _render) = noop_cache();
+    let render_device = RenderDevice::from(device);
+    std::thread::spawn(move || {
+        assert_eq!(catch_driver_failure(&render_device, || 7), Ok(7));
+        let validation = render_device
+            .wgpu_device()
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let created = catch_driver_failure(&render_device, || {
+            render_device
+                .wgpu_device()
+                .create_texture(&TextureDescriptor {
+                    label: None,
+                    size: Extent3d {
+                        width: 0,
+                        height: 0,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Rgba8Unorm,
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+        });
+        assert!(created.is_ok());
+        assert!(matches!(
+            bevy_tasks::block_on(validation.pop()),
+            Some(wgpu::Error::Validation { .. })
+        ));
+    })
+    .join()
+    .unwrap();
 }
