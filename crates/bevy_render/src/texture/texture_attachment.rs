@@ -155,6 +155,10 @@ impl DepthStencilViews {
     }
 
     /// Create the appropriate views for a depth-stencil texture based on its texture format.
+    ///
+    /// Formats with a single aspect reuse the cached texture's default view, whose all-aspects
+    /// view is that aspect, rather than creating a view every frame. A view created every frame
+    /// makes Vulkan create and destroy a framebuffer for every pass that attaches it.
     fn from_texture(texture: &CachedTexture) -> Self {
         let depth_view = || {
             texture.texture.create_view(&TextureViewDescriptor {
@@ -172,17 +176,15 @@ impl DepthStencilViews {
 
         match texture.texture.format().channels() {
             wgpu_types::TextureChannel::DEPTH_STENCIL => DepthStencilViews::DepthStencil {
-                combined_view: texture
-                    .texture
-                    .create_view(&TextureViewDescriptor::default()),
+                combined_view: texture.default_view.clone(),
                 depth_view: depth_view(),
                 stencil_view: stencil_view(),
             },
             wgpu_types::TextureChannel::DEPTH => DepthStencilViews::DepthOnly {
-                depth_view: depth_view(),
+                depth_view: texture.default_view.clone(),
             },
             wgpu_types::TextureChannel::STENCIL => DepthStencilViews::StencilOnly {
-                stencil_view: stencil_view(),
+                stencil_view: texture.default_view.clone(),
             },
             _ => {
                 panic!(
@@ -442,5 +444,44 @@ impl OutputColorAttachment {
     // are always consumed by a render pass that writes to the attachment
     pub fn needs_present(&self) -> bool {
         !self.is_first_call.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{test_utils::create_dummy_device, texture::TextureCache};
+    use wgpu::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
+
+    /// A depth attachment prepared every frame from the same cached texture attaches the same
+    /// view each time, so passes that use it keep their framebuffers.
+    #[test]
+    fn depth_attachments_reuse_the_cached_default_view() {
+        let (device, _queue) = create_dummy_device();
+        let mut cache = TextureCache::default();
+        let descriptor = TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let texture = cache.get(&device, descriptor);
+        for _frame in 0..2 {
+            let attachment = DepthStencilAttachment::new(texture.clone(), None, Some(0.0), None);
+            let views = attachment.depth_stencil_views();
+            assert_eq!(views.attachment_view().id(), texture.default_view.id());
+            assert_eq!(
+                views.depth_only_view().map(TextureView::id),
+                Some(texture.default_view.id())
+            );
+        }
     }
 }
