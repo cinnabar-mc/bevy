@@ -18,8 +18,6 @@ use bevy_ecs::{
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, Schedule, ScheduleLabel, SystemSet},
     system::SystemState,
 };
-#[cfg(feature = "trace")]
-use bevy_log::info_span;
 use bevy_reflect::Reflect;
 use bevy_render::{
     camera::{ExtractedCamera, SortedCameras},
@@ -279,15 +277,7 @@ pub(crate) fn submit_pending_command_buffers(
     state: &mut SystemState<(ResMut<PendingCommandBuffers>, Res<RenderQueue>)>,
 ) {
     let (mut pending, queue) = state.get_mut(world).unwrap();
-    #[cfg(feature = "trace")]
-    let buffer_count = pending.len();
-    let mut buffers = pending.finish().peekable();
-
-    if buffers.peek().is_some() {
-        #[cfg(feature = "trace")]
-        let _span = info_span!("queue_submit", count = buffer_count).entered();
-        queue.submit(buffers);
-    }
+    pending.submit(&queue);
 }
 
 pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
