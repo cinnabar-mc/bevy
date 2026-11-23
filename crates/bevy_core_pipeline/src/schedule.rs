@@ -118,9 +118,20 @@ impl Core2d {
     }
 }
 
-/// Holds the entity of windows that are a render target for a camera
-#[derive(Resource)]
-struct CameraWindows(EntityHashSet);
+/// The windows that are a render target for a camera, from [`camera_driver`] until
+/// [`handle_uncovered_swap_chains`] takes them.
+///
+/// The resource stays in the render world between frames, so handing the set over each frame
+/// spawns and despawns nothing.
+#[derive(Resource, Default)]
+struct CameraWindows(Option<EntityHashSet>);
+
+/// The windows and the auxiliary views that [`camera_driver`] reads, with query states kept
+/// between frames.
+type CameraDriverQueries = (
+    Query<'static, 'static, (MainEntity, &'static ExtractedWindow)>,
+    Query<'static, 'static, Entity, With<RootNonCameraView>>,
+);
 
 /// A render-world marker component for a view that corresponds to neither a
 /// camera nor a camera-associated shadow map.
@@ -140,16 +151,16 @@ pub struct RootNonCameraView(#[reflect(ignore)] pub InternedScheduleLabel);
 /// and every pending command buffer is submitted to the GPU at once. Users can order any additional
 /// operations (e.g. one-off compute passes) before or after this system in the root render
 /// graph schedule.
-pub fn camera_driver(
-    world: &mut World,
-    state: &mut SystemState<Query<(MainEntity, &ExtractedWindow)>>,
-) {
+pub fn camera_driver(world: &mut World, state: &mut SystemState<CameraDriverQueries>) {
     // Gather up all cameras and auxiliary views not associated with a camera.
     let root_views: Vec<_> = {
-        let mut auxiliary_views = world.query_filtered::<Entity, With<RootNonCameraView>>();
+        let auxiliary_views = state
+            .get(world)
+            .map(|(_, auxiliary_views)| auxiliary_views.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
         let sorted = world.resource::<SortedCameras>();
         auxiliary_views
-            .iter(world)
+            .into_iter()
             .map(RootView::Auxiliary)
             .chain(sorted.0.iter().map(|c| RootView::Camera {
                 entity: c.entity,
@@ -210,7 +221,7 @@ pub fn camera_driver(
                 if let Some(NormalizedRenderTarget::Window(window_ref)) = &target {
                     let window_entity = window_ref.entity();
 
-                    if let Ok(windows) = state.get(world)
+                    if let Ok((windows, _)) = state.get(world)
                         && windows
                             .iter()
                             .find(|(e, _)| *e == window_entity)
@@ -251,7 +262,7 @@ pub fn camera_driver(
 
     world.remove_resource::<CurrentView>();
 
-    world.insert_resource(CameraWindows(camera_windows));
+    world.get_resource_or_init::<CameraWindows>().0 = Some(camera_windows);
 }
 
 /// A view not associated with any other camera.
@@ -290,18 +301,26 @@ pub(crate) fn submit_pending_command_buffers(
     }
 }
 
-pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
+pub(crate) fn handle_uncovered_swap_chains(
+    world: &mut World,
+    windows: &mut SystemState<Query<(MainEntity, &ExtractedWindow)>>,
+) {
     let windows_to_clear: Vec<_> = {
         let clear_color = world.resource::<ClearColor>().0.to_linear();
-        let Some(camera_windows) = world.remove_resource::<CameraWindows>() else {
+        let Some(camera_windows) = world
+            .get_resource_mut::<CameraWindows>()
+            .and_then(|mut camera_windows| camera_windows.0.take())
+        else {
+            return;
+        };
+        let Ok(windows) = windows.get(world) else {
             return;
         };
 
-        world
-            .query::<(MainEntity, &ExtractedWindow)>()
-            .iter(world)
+        windows
+            .iter()
             .filter_map(|(window_entity, window)| {
-                if camera_windows.0.contains(&window_entity.entity()) {
+                if camera_windows.contains(&window_entity.entity()) {
                     return None;
                 }
                 let swap_chain_texture = window.swap_chain_texture_view.as_ref()?;
@@ -340,4 +359,66 @@ pub(crate) fn handle_uncovered_swap_chains(world: &mut World) {
             encoder.begin_render_pass(&pass_descriptor);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::schedule::Schedule;
+
+    #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+    struct AuxiliaryView;
+
+    #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+    struct Frame;
+
+    #[derive(Resource, Default)]
+    struct Runs(usize);
+
+    #[derive(Component)]
+    struct Marker;
+
+    fn frame_world() -> (World, Schedule) {
+        let mut world = World::new();
+        world.init_resource::<SortedCameras>();
+        world.init_resource::<ClearColor>();
+        world.init_resource::<Runs>();
+        let mut auxiliary = Schedule::new(AuxiliaryView);
+        auxiliary.add_systems(|mut runs: ResMut<Runs>| runs.0 += 1);
+        world.add_schedule(auxiliary);
+        let mut frame = Schedule::new(Frame);
+        frame.add_systems((camera_driver, handle_uncovered_swap_chains).chain());
+        (world, frame)
+    }
+
+    #[test]
+    fn auxiliary_views_spawned_between_frames_are_driven() {
+        let (mut world, mut frame) = frame_world();
+        frame.run(&mut world);
+        assert_eq!(world.resource::<Runs>().0, 0);
+        world.spawn(RootNonCameraView(AuxiliaryView.intern()));
+        frame.run(&mut world);
+        assert_eq!(world.resource::<Runs>().0, 1);
+        // A view in a new archetype is found too.
+        world.spawn((RootNonCameraView(AuxiliaryView.intern()), Marker));
+        frame.run(&mut world);
+        assert_eq!(world.resource::<Runs>().0, 3);
+    }
+
+    #[test]
+    fn camera_windows_are_handed_over_once_per_frame() {
+        let (mut world, mut frame) = frame_world();
+        frame.run(&mut world);
+        assert!(world.resource::<CameraWindows>().0.is_none());
+        let entities = world.entities().count_spawned();
+        for _ in 0..3 {
+            frame.run(&mut world);
+            assert!(world.resource::<CameraWindows>().0.is_none());
+        }
+        assert_eq!(
+            world.entities().count_spawned(),
+            entities,
+            "the hand-off leaves the render world's entities alone"
+        );
+    }
 }
