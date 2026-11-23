@@ -105,7 +105,9 @@ pub fn render_system(
     // before presentation.
     if !world.resource::<PendingCommandBuffers>().is_empty() {
         let render_queue = world.resource::<RenderQueue>().clone();
-        render_queue.submit(world.resource_mut::<PendingCommandBuffers>().finish());
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit(&render_queue);
     }
 
     {
