@@ -144,8 +144,8 @@ fn extract_windows(
     marked_primary: Query<(), With<PrimaryWindow>>,
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
-        // Render systems only filter on the marker, so a window that already has it needs no
-        // replacement every frame.
+        // Render systems only filter on the marker; none reads its change ticks or observes its
+        // insertion, so a window that already has it needs no replacement every frame.
         if is_primary && !marked_primary.contains(render_entity) {
             commands.entity(render_entity).insert(PrimaryWindow);
         }

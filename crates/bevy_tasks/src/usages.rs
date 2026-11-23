@@ -80,7 +80,9 @@ crate::cfg::web! {
         /// A function used by `bevy_app` to tick the global tasks pools on the main thread.
         /// This will run a maximum of 100 local tasks per executor per call to this function,
         /// one per executor per round, and stops after a round in which none of them had a
-        /// runnable task: tasks woken by the tasks that ran are already queued by then.
+        /// runnable task: tasks woken by the tasks that ran are already queued by then. A task
+        /// woken from another thread after that round runs on the next call, as one woken after
+        /// the last round always did.
         ///
         /// # Warning
         ///
@@ -172,5 +174,23 @@ mod tests {
             .detach();
         tick_global_task_pools_on_main_thread();
         assert_eq!(later.load(Ordering::Relaxed), 5);
+
+        // A task woken from another thread runs on the next call after the wake.
+        let (sender, receiver) = async_channel::bounded::<()>(1);
+        let woken = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&woken);
+        ComputeTaskPool::get()
+            .spawn_local(async move {
+                receiver.recv().await.unwrap();
+                seen.fetch_add(1, Ordering::Relaxed);
+            })
+            .detach();
+        tick_global_task_pools_on_main_thread();
+        assert_eq!(woken.load(Ordering::Relaxed), 0);
+        std::thread::spawn(move || sender.send_blocking(()).unwrap())
+            .join()
+            .unwrap();
+        tick_global_task_pools_on_main_thread();
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
     }
 }

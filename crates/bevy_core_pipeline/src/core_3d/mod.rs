@@ -563,12 +563,6 @@ pub fn extract_camera_prepass_phase(
     >,
     mut live_entities: Local<HashSet<RetainedViewEntity>>,
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
-    render_prepasses: Query<(
-        Has<DepthPrepass>,
-        Has<NormalPrepass>,
-        Has<MotionVectorPrepass>,
-        Has<DeferredPrepass>,
-    )>,
 ) {
     live_entities.clear();
 
@@ -621,16 +615,7 @@ pub fn extract_camera_prepass_phase(
         }
         live_entities.insert(retained_view_entity);
 
-        // Add or remove prepasses as appropriate. Only this system adds the four prepass markers
-        // to render cameras, so one the camera lacks now is still absent when the commands apply,
-        // and its removal is skipped. Other extraction (Solari) also edits the double-buffer
-        // markers, so those are always removed here as before.
-        let (
-            has_depth_prepass,
-            has_normal_prepass,
-            has_motion_vector_prepass,
-            has_deferred_prepass,
-        ) = render_prepasses.get(entity).unwrap_or_default();
+        // Add or remove prepasses as appropriate.
 
         let mut camera_commands = commands
             .get_entity(entity)
@@ -638,25 +623,25 @@ pub fn extract_camera_prepass_phase(
 
         if depth_prepass {
             camera_commands.insert(DepthPrepass);
-        } else if has_depth_prepass {
+        } else {
             camera_commands.remove::<DepthPrepass>();
         }
 
         if normal_prepass {
             camera_commands.insert(NormalPrepass);
-        } else if has_normal_prepass {
+        } else {
             camera_commands.remove::<NormalPrepass>();
         }
 
         if motion_vector_prepass {
             camera_commands.insert(MotionVectorPrepass);
-        } else if has_motion_vector_prepass {
+        } else {
             camera_commands.remove::<MotionVectorPrepass>();
         }
 
         if deferred_prepass {
             camera_commands.insert(DeferredPrepass);
-        } else if has_deferred_prepass {
+        } else {
             camera_commands.remove::<DeferredPrepass>();
         }
 
@@ -1065,5 +1050,58 @@ fn package_double_buffered_depth_texture(
         }
         (Some(t1), Some(t2)) => Some(DepthStencilAttachment::new(t2, Some(t1), Some(0.0), None)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{entity_disabling::Disabled, schedule::Schedule};
+    use bevy_render::{batching::gpu_preprocessing::GpuPreprocessingMode, MainWorld};
+
+    /// A render world whose main world holds one active 3D camera without prepasses, synced to a
+    /// render camera spawned with `render`.
+    fn worlds(render: impl Bundle) -> (World, Entity) {
+        let mut render_world = World::new();
+        let render_camera = render_world.spawn(render).id();
+        let mut main_world = World::new();
+        main_world.spawn((Camera3d::default(), RenderEntity::from(render_camera)));
+        let mut extracted = MainWorld::default();
+        *extracted = main_world;
+        render_world.insert_resource(extracted);
+        render_world.init_resource::<ViewBinnedRenderPhases<Opaque3dPrepass>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<AlphaMask3dPrepass>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<Opaque3dDeferred>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<AlphaMask3dDeferred>>();
+        render_world.insert_resource(GpuPreprocessingSupport {
+            max_supported_mode: GpuPreprocessingMode::None,
+        });
+        (render_world, render_camera)
+    }
+
+    #[test]
+    fn prepass_markers_are_removed_from_a_disabled_render_camera() {
+        let (mut world, camera) = worlds((DepthPrepass, Disabled));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(extract_camera_prepass_phase);
+        schedule.run(&mut world);
+        assert!(!world.entity(camera).contains::<DepthPrepass>());
+    }
+
+    #[test]
+    fn prepass_markers_queued_earlier_in_extraction_are_removed() {
+        let (mut world, camera) = worlds(());
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(camera).insert(DepthPrepass);
+                },
+                extract_camera_prepass_phase,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut world);
+        assert!(!world.entity(camera).contains::<DepthPrepass>());
     }
 }

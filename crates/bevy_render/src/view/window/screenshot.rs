@@ -252,10 +252,11 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-/// Despawns last frame's captured screenshots. Only [`trigger_screenshots`] adds [`Captured`],
-/// in `Update`, so no captured entity can appear between this system and the `ApplyDeferred`
-/// it runs before; with none present, the despawn command (which builds a query each time)
-/// is not queued.
+/// Despawns last frame's captured screenshots. Bevy only adds [`Captured`] in
+/// [`trigger_screenshots`], in `Update`, so no captured entity can appear between this system and
+/// the `ApplyDeferred` it runs before; with none present, the despawn command (which builds a query
+/// each time) is not queued. An app that queues `Captured` itself in `First`, ahead of that flush,
+/// has those entities despawned a frame later.
 fn clear_screenshots(mut commands: Commands, captured: Query<(), With<Captured>>) {
     if !captured.is_empty() {
         commands.despawn_all::<With<Captured>>();
