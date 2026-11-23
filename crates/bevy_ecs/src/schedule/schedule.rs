@@ -392,8 +392,10 @@ impl Chain {
 /// ```
 pub struct Schedule {
     label: InternedScheduleLabel,
-    graph: ScheduleGraph,
-    executable: SystemSchedule,
+    // The graph and executable are boxed so that a `Schedule` stays a few words: running a
+    // schedule from `Schedules` moves it out of the map and back in every time.
+    graph: Box<ScheduleGraph>,
+    executable: Box<SystemSchedule>,
     executor: Box<dyn SystemExecutor>,
     executor_initialized: bool,
 }
@@ -416,8 +418,8 @@ impl Schedule {
     pub fn new(label: impl ScheduleLabel) -> Self {
         let mut this = Self {
             label: label.intern(),
-            graph: ScheduleGraph::new(),
-            executable: SystemSchedule::new(),
+            graph: Box::new(ScheduleGraph::new()),
+            executable: Box::new(SystemSchedule::new()),
             executor: default_executor(),
             executor_initialized: false,
         };
@@ -2017,6 +2019,16 @@ mod tests {
 
     #[derive(Resource)]
     struct Resource2;
+
+    #[test]
+    fn schedule_stays_small_enough_to_move_cheaply() {
+        // `World::schedule_scope` moves the schedule out of `Schedules` and back on every run.
+        assert!(
+            size_of::<Schedule>() <= size_of::<[usize; 8]>(),
+            "Schedule grew to {} bytes",
+            size_of::<Schedule>()
+        );
+    }
 
     #[test]
     fn unchanged_auto_insert_apply_deferred_has_no_effect() {
