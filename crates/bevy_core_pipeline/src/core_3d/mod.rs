@@ -563,6 +563,12 @@ pub fn extract_camera_prepass_phase(
     >,
     mut live_entities: Local<HashSet<RetainedViewEntity>>,
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
+    render_prepasses: Query<(
+        Has<DepthPrepass>,
+        Has<NormalPrepass>,
+        Has<MotionVectorPrepass>,
+        Has<DeferredPrepass>,
+    )>,
 ) {
     live_entities.clear();
 
@@ -615,7 +621,16 @@ pub fn extract_camera_prepass_phase(
         }
         live_entities.insert(retained_view_entity);
 
-        // Add or remove prepasses as appropriate.
+        // Add or remove prepasses as appropriate. Only this system adds the four prepass markers
+        // to render cameras, so one the camera lacks now is still absent when the commands apply,
+        // and its removal is skipped. Other extraction (Solari) also edits the double-buffer
+        // markers, so those are always removed here as before.
+        let (
+            has_depth_prepass,
+            has_normal_prepass,
+            has_motion_vector_prepass,
+            has_deferred_prepass,
+        ) = render_prepasses.get(entity).unwrap_or_default();
 
         let mut camera_commands = commands
             .get_entity(entity)
@@ -623,25 +638,25 @@ pub fn extract_camera_prepass_phase(
 
         if depth_prepass {
             camera_commands.insert(DepthPrepass);
-        } else {
+        } else if has_depth_prepass {
             camera_commands.remove::<DepthPrepass>();
         }
 
         if normal_prepass {
             camera_commands.insert(NormalPrepass);
-        } else {
+        } else if has_normal_prepass {
             camera_commands.remove::<NormalPrepass>();
         }
 
         if motion_vector_prepass {
             camera_commands.insert(MotionVectorPrepass);
-        } else {
+        } else if has_motion_vector_prepass {
             camera_commands.remove::<MotionVectorPrepass>();
         }
 
         if deferred_prepass {
             camera_commands.insert(DeferredPrepass);
-        } else {
+        } else if has_deferred_prepass {
             camera_commands.remove::<DeferredPrepass>();
         }
 

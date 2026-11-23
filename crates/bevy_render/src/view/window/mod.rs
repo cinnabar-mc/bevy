@@ -141,9 +141,12 @@ fn extract_windows(
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
     mut removed_primary: Extract<RemovedComponents<PrimaryWindow>>,
     mapper: Extract<Query<&RenderEntity>>,
+    marked_primary: Query<(), With<PrimaryWindow>>,
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
-        if is_primary {
+        // Render systems only filter on the marker, so a window that already has it needs no
+        // replacement every frame.
+        if is_primary && !marked_primary.contains(render_entity) {
             commands.entity(render_entity).insert(PrimaryWindow);
         }
 
