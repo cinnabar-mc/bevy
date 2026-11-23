@@ -16,7 +16,10 @@ use crate::{
     },
     resource::{Resource, ResourceEntities, IS_RESOURCE},
     system::{Query, Single, SystemAccess, SystemMeta, SystemState},
-    world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, FromWorld, World},
+    world::{
+        unsafe_world_cell::{ResourcePointerCache, UnsafeWorldCell},
+        DeferredWorld, FromWorld, World,
+    },
 };
 
 #[expect(deprecated, reason = "`FilteredResources` will be removed.")]
@@ -669,27 +672,48 @@ macro_rules! impl_param_set {
 
 all_tuples_enumerated!(impl_param_set, 1, 8, P, p);
 
+/// The [`SystemParam::State`] of [`Res`] and [`ResMut`]: the resource's id and the pointers of
+/// its last fetch, which are reused while the resource's storage is unchanged.
+pub struct ResourceParamState {
+    component_id: ComponentId,
+    pointers: ResourcePointerCache,
+}
+
+impl ResourceParamState {
+    fn new(component_id: ComponentId) -> Self {
+        Self {
+            component_id,
+            pointers: ResourcePointerCache::default(),
+        }
+    }
+
+    /// The [`ComponentId`] of the resource.
+    pub fn component_id(&self) -> ComponentId {
+        self.component_id
+    }
+}
+
 // SAFETY: Res only reads a single World resource
 unsafe impl<'a, T: Resource> ReadOnlySystemParam for Res<'a, T> {}
 
 // SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
 // conflicts with any prior access, a panic will occur.
 unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
-    type State = ComponentId;
+    type State = ResourceParamState;
     type Item<'w, 's> = Res<'w, T>;
 
     fn init_state(world: &mut World) -> Self::State {
-        world.components_registrator().register_component::<T>()
+        ResourceParamState::new(world.components_registrator().register_component::<T>())
     }
 
     fn init_access(
-        &component_id: &Self::State,
+        state: &Self::State,
         system_meta: &mut SystemMeta,
         system_access: &mut SystemAccess,
         world: &mut World,
     ) {
         let mut filter = FilteredAccess::default();
-        filter.add_read(component_id);
+        filter.add_read(state.component_id);
         filter.and_with(IS_RESOURCE);
 
         if let Err(conflicts) = system_access.try_add(filter) {
@@ -704,14 +728,16 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
 
     #[inline]
     unsafe fn get_param<'w, 's>(
-        &mut component_id: &'s mut Self::State,
+        state: &'s mut Self::State,
         system_meta: &SystemMeta,
         world: UnsafeWorldCell<'w>,
         change_tick: Tick,
     ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
-        let (ptr, ticks) = world.get_resource_with_ticks(component_id).ok_or_else(|| {
-            SystemParamValidationError::invalid::<Self>("Resource does not exist")
-        })?;
+        let (ptr, ticks) = world
+            .get_resource_with_ticks_cached(state.component_id, &mut state.pointers)
+            .ok_or_else(|| {
+                SystemParamValidationError::invalid::<Self>("Resource does not exist")
+            })?;
         Ok(Res {
             value: ptr.deref(),
             ticks: ComponentTicksRef {
@@ -728,21 +754,21 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
 // SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
 // conflicts with any prior access, a panic will occur.
 unsafe impl<'a, T: Resource<Mutability = Mutable>> SystemParam for ResMut<'a, T> {
-    type State = ComponentId;
+    type State = ResourceParamState;
     type Item<'w, 's> = ResMut<'w, T>;
 
     fn init_state(world: &mut World) -> Self::State {
-        world.components_registrator().register_component::<T>()
+        ResourceParamState::new(world.components_registrator().register_component::<T>())
     }
 
     fn init_access(
-        &component_id: &Self::State,
+        state: &Self::State,
         system_meta: &mut SystemMeta,
         system_access: &mut SystemAccess,
         world: &mut World,
     ) {
         let mut filter = FilteredAccess::default();
-        filter.add_write(component_id);
+        filter.add_write(state.component_id);
         filter.and_with(IS_RESOURCE);
 
         if let Err(conflicts) = system_access.try_add(filter) {
@@ -757,20 +783,23 @@ unsafe impl<'a, T: Resource<Mutability = Mutable>> SystemParam for ResMut<'a, T>
 
     #[inline]
     unsafe fn get_param<'w, 's>(
-        &mut component_id: &'s mut Self::State,
+        state: &'s mut Self::State,
         system_meta: &SystemMeta,
         world: UnsafeWorldCell<'w>,
         change_tick: Tick,
     ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
-        let value = world.get_resource_mut_by_id(component_id).ok_or_else(|| {
-            SystemParamValidationError::invalid::<Self>("Resource does not exist")
-        })?;
+        world.assert_allows_mutable_access();
+        let (ptr, ticks) = world
+            .get_resource_with_ticks_cached(state.component_id, &mut state.pointers)
+            .ok_or_else(|| {
+                SystemParamValidationError::invalid::<Self>("Resource does not exist")
+            })?;
         Ok(ResMut {
-            value: value.value.deref_mut::<T>(),
+            value: ptr.assert_unique().deref_mut::<T>(),
             ticks: ComponentTicksMut {
-                added: value.ticks.added,
-                changed: value.ticks.changed,
-                changed_by: value.ticks.changed_by,
+                added: ticks.added.deref_mut(),
+                changed: ticks.changed.deref_mut(),
+                changed_by: ticks.changed_by.map(|changed_by| changed_by.deref_mut()),
                 last_run: system_meta.last_run,
                 this_run: change_tick,
                 summary_tick: None,
@@ -2838,12 +2867,79 @@ mod tests {
     use bevy_ecs_macros::Component;
 
     use super::*;
+    use crate::change_detection::{DetectChanges, Mut};
     use crate::query::Without;
     use crate::resource::IsResource;
     use crate::schedule::Schedule;
     use crate::system::{assert_is_system, Commands, IntoSystem, System};
     use crate::world::EntityMut;
     use core::cell::RefCell;
+
+    #[derive(Resource, PartialEq, Debug)]
+    struct Cached(u32);
+
+    #[test]
+    fn res_fetch_follows_removal_and_reinsertion() {
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), None);
+        world.insert_resource(Cached(1));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(1));
+        world.remove_resource::<Cached>();
+        assert_eq!(system.run((), &mut world).unwrap(), None);
+        world.insert_resource(Cached(2));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(2));
+        world.insert_resource(Cached(3));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn res_fetch_follows_storage_grown_by_rejected_duplicates() {
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        system.initialize(&mut world);
+        world.insert_resource(Cached(7));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(7));
+        // Each duplicate is stored beside the resource, growing its storage, until the queued
+        // removal rejects it.
+        for i in 0..64 {
+            world.spawn(Cached(1000 + i));
+            assert_eq!(system.run((), &mut world).unwrap(), Some(7));
+        }
+        world.flush();
+        assert_eq!(system.run((), &mut world).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn res_mut_writes_reach_a_resource_moved_by_resource_scope() {
+        let mut world = World::new();
+        world.insert_resource(Cached(0));
+        let mut increment = IntoSystem::into_system(|mut value: ResMut<Cached>| value.0 += 1);
+        increment.initialize(&mut world);
+        increment.run((), &mut world).unwrap();
+        world.resource_scope(|world, mut value: Mut<Cached>| {
+            value.0 += 10;
+            world.spawn(Cached(55));
+        });
+        increment.run((), &mut world).unwrap();
+        assert_eq!(world.resource::<Cached>(), &Cached(12));
+    }
+
+    #[test]
+    fn res_fetch_keeps_change_detection() {
+        let mut world = World::new();
+        world.insert_resource(Cached(0));
+        let mut changed = IntoSystem::into_system(|value: Res<Cached>| value.is_changed());
+        changed.initialize(&mut world);
+        assert!(changed.run((), &mut world).unwrap());
+        assert!(!changed.run((), &mut world).unwrap());
+        world.resource_mut::<Cached>().0 = 4;
+        assert!(changed.run((), &mut world).unwrap());
+        assert!(!changed.run((), &mut world).unwrap());
+        world.insert_resource(Cached(5));
+        assert!(changed.run((), &mut world).unwrap());
+    }
 
     #[test]
     #[should_panic]

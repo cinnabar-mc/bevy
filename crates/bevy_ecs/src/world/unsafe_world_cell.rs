@@ -21,9 +21,14 @@ use crate::{
     storage::{ComponentSparseSet, Storages, Table},
     system::Commands,
 };
-use bevy_platform::sync::atomic::Ordering;
+use bevy_platform::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use bevy_ptr::{Ptr, UnsafeCellDeref};
-use core::{any::TypeId, cell::UnsafeCell, fmt::Debug, marker::PhantomData, ptr::NonNull};
+use core::{
+    any::TypeId, cell::UnsafeCell, fmt::Debug, marker::PhantomData, panic::Location, ptr::NonNull,
+};
 use thiserror::Error;
 
 /// Variant of the [`World`] where resource and component accesses take `&self`, and the responsibility to avoid
@@ -713,6 +718,72 @@ impl<'w> UnsafeWorldCell<'w> {
         // - caller ensures that we have permission to access this resource
         // - storage_type and location are valid
         unsafe { get_component_and_ticks(self, component_id, storage_type, entity, location) }
+    }
+
+    /// Like [`Self::get_resource_with_ticks`], but reuses the pointers held by `cache` while the
+    /// resource's storage is unchanged, and refreshes them otherwise.
+    ///
+    /// The returned cells carry no summary tick.
+    ///
+    /// # Safety
+    /// It is the caller's responsibility to ensure that
+    /// - the [`UnsafeWorldCell`] has permission to access the resource
+    /// - no mutable reference to the resource exists at the same time
+    /// - `cache` has only been used with this world
+    #[inline]
+    pub(crate) unsafe fn get_resource_with_ticks_cached(
+        self,
+        component_id: ComponentId,
+        cache: &mut ResourcePointerCache,
+    ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
+        if let Some(pointers) = &cache.0
+            && pointers.is_current()
+        {
+            // SAFETY: An unchanged structure version means the pointers still address this
+            // resource's value and ticks in this world; the caller upholds access.
+            return Some(unsafe { pointers.cells() });
+        }
+        // SAFETY: Upheld by the caller.
+        unsafe { self.refresh_resource_pointers(component_id, cache) }
+    }
+
+    /// Looks a resource up as [`Self::get_resource_with_ticks`] does and stores its pointers in
+    /// `cache` when its storage reports structural changes.
+    ///
+    /// # Safety
+    /// See [`Self::get_resource_with_ticks_cached`].
+    #[inline(never)]
+    unsafe fn refresh_resource_pointers(
+        self,
+        component_id: ComponentId,
+        cache: &mut ResourcePointerCache,
+    ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
+        cache.0 = None;
+        // SAFETY: We have permission to access the resource of `component_id`.
+        let entity = unsafe { self.resource_entities() }.get(component_id)?;
+        let storage_type = self.components().get_info(component_id)?.storage_type();
+        let location = self.get_entity(entity).ok()?.location();
+        // SAFETY:
+        // - caller ensures there is no `&mut World` and no mutable borrow of this resource
+        // - caller ensures that we have permission to access this resource
+        // - storage_type and location are valid
+        let (value, cells) =
+            unsafe { get_component_and_ticks(self, component_id, storage_type, entity, location) }?;
+        if storage_type == StorageType::SparseSet {
+            // SAFETY: Only the set's structure version is read.
+            let set = unsafe { self.fetch_sparse_set(component_id) }?;
+            let version = set.structure_version();
+            cache.0 = Some(CachedResourcePointers {
+                seen: version.load(Ordering::Relaxed),
+                version: version.clone(),
+                // SAFETY: `Ptr` is never null.
+                value: unsafe { NonNull::new_unchecked(value.as_ptr().cast_mut()) },
+                added: NonNull::from(cells.added),
+                changed: NonNull::from(cells.changed),
+                changed_by: cells.changed_by.map(NonNull::from),
+            });
+        }
+        Some((value, cells))
     }
 
     // Shorthand helper function for getting the data and change ticks for a resource.
@@ -1490,5 +1561,52 @@ mod tests {
         let entity_cell = world_cell.get_entity(entity).unwrap();
         // SAFETY: this invalid usage will be caught by a runtime panic.
         let _ = unsafe { entity_cell.get_mut::<C>() };
+    }
+}
+
+/// Pointers to one resource's value and change ticks that a system parameter keeps between runs,
+/// so a resource whose sparse-set storage has not changed needs no lookup.
+#[derive(Default)]
+pub(crate) struct ResourcePointerCache(Option<CachedResourcePointers>);
+
+struct CachedResourcePointers {
+    version: Arc<AtomicU64>,
+    seen: u64,
+    value: NonNull<u8>,
+    added: NonNull<UnsafeCell<Tick>>,
+    changed: NonNull<UnsafeCell<Tick>>,
+    changed_by: MaybeLocation<NonNull<UnsafeCell<&'static Location<'static>>>>,
+}
+
+// SAFETY: The pointers are only dereferenced by `UnsafeWorldCell::get_resource_with_ticks_cached`,
+// whose caller holds access to the resource in the world they came from. Resources are `Send` and
+// `Sync`.
+unsafe impl Send for CachedResourcePointers {}
+// SAFETY: See the `Send` implementation.
+unsafe impl Sync for CachedResourcePointers {}
+
+impl CachedResourcePointers {
+    /// Whether the sparse set holding the resource is unchanged since the pointers were read.
+    #[inline]
+    fn is_current(&self) -> bool {
+        self.version.load(Ordering::Relaxed) == self.seen
+    }
+
+    /// # Safety
+    /// [`Self::is_current`] must hold, and the caller must hold access to the resource for `'w`.
+    #[inline]
+    unsafe fn cells<'w>(&self) -> (Ptr<'w>, ComponentTickCells<'w>) {
+        // SAFETY: Upheld by the caller; the pointers came from live references into the storage.
+        unsafe {
+            (
+                Ptr::new(self.value),
+                ComponentTickCells {
+                    added: self.added.as_ref(),
+                    changed: self.changed.as_ref(),
+                    changed_by: self.changed_by.map(|changed_by| changed_by.as_ref()),
+                    summary_tick: None,
+                },
+            )
+        }
     }
 }

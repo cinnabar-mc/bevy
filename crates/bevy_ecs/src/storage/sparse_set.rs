@@ -6,6 +6,10 @@ use crate::{
     storage::{AbortOnPanic, Column, TableRow, VecExtensions},
 };
 use alloc::{boxed::Box, vec::Vec};
+use bevy_platform::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use bevy_ptr::{OwningPtr, Ptr};
 use core::{cell::UnsafeCell, hash::Hash, marker::PhantomData, num::NonZero, panic::Location};
 use nonmax::{NonMaxU32, NonMaxUsize};
@@ -165,6 +169,9 @@ pub struct ComponentSparseSet {
     #[cfg(debug_assertions)]
     entities: Vec<Entity>,
     sparse: SparseArray<EntityIndex, TableRow>,
+    /// Advances whenever a value is added, removed or moved, so pointers into this set's storage
+    /// that were read at one version stay valid while the version is unchanged.
+    structure_version: Arc<AtomicU64>,
 }
 
 impl ComponentSparseSet {
@@ -176,11 +183,29 @@ impl ComponentSparseSet {
             dense: Column::with_capacity(component_info, entities.capacity()),
             entities,
             sparse: Default::default(),
+            structure_version: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The counter that advances whenever a value in this set is added, removed or moved.
+    ///
+    /// Pointers returned by [`Self::get_with_ticks`] keep addressing the same entity's value and
+    /// change ticks while the counter holds the value it had when they were read.
+    #[inline]
+    pub(crate) fn structure_version(&self) -> &Arc<AtomicU64> {
+        &self.structure_version
+    }
+
+    /// Marks every pointer into this set's storage as stale.
+    #[inline]
+    fn advance_structure_version(&self) {
+        // Structural changes need `&mut self`, so a relaxed increment cannot race a reader.
+        self.structure_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Removes all of the values stored within.
     pub(crate) fn clear(&mut self) {
+        self.advance_structure_version();
         // SAFETY: This is using the size of the ComponentSparseSet.
         unsafe { self.dense.clear(self.len()) };
         self.entities.clear();
@@ -221,6 +246,7 @@ impl ComponentSparseSet {
             assert_eq!(entity, self.entities[dense_index.index()]);
             self.dense.replace(dense_index, value, change_tick, caller);
         } else {
+            self.advance_structure_version();
             let dense_index = self.entities.len();
             let capacity = self.entities.capacity();
 
@@ -371,6 +397,7 @@ impl ComponentSparseSet {
     #[must_use = "The returned pointer must be used to drop the removed component."]
     pub(crate) fn remove_and_forget(&mut self, entity: Entity) -> Option<OwningPtr<'_>> {
         self.sparse.remove(entity.index()).map(|dense_index| {
+            self.advance_structure_version();
             #[cfg(debug_assertions)]
             assert_eq!(entity, self.entities[dense_index.index()]);
             let last = self.entities.len() - 1;
@@ -423,6 +450,7 @@ impl ComponentSparseSet {
         self.sparse
             .remove(entity.index())
             .map(|dense_index| {
+                self.advance_structure_version();
                 #[cfg(debug_assertions)]
                 assert_eq!(entity, self.entities[dense_index.index()]);
                 let last = self.entities.len() - 1;
@@ -860,6 +888,58 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq)]
     struct Foo(usize);
+
+    #[test]
+    fn structure_version_advances_on_every_structural_change() {
+        use crate::world::World;
+        use core::sync::atomic::Ordering;
+
+        #[derive(Component)]
+        #[component(storage = "SparseSet")]
+        struct Sparse;
+
+        let mut world = World::new();
+        let id = world.register_component::<Sparse>();
+        let first = world.spawn(Sparse).id();
+        let version = |world: &World| {
+            world
+                .storages()
+                .sparse_sets
+                .get(id)
+                .unwrap()
+                .structure_version()
+                .load(Ordering::Relaxed)
+        };
+        let mut last = version(&world);
+        let mut advanced = |world: &World| {
+            let now = version(world);
+            let moved = now != last;
+            last = now;
+            moved
+        };
+
+        world.entity_mut(first).insert(Sparse);
+        assert!(
+            !advanced(&world),
+            "replacing a value in place keeps pointers valid"
+        );
+        let second = world.spawn(Sparse).id();
+        assert!(
+            advanced(&world),
+            "adding a value can reallocate the storage"
+        );
+        world.entity_mut(first).remove::<Sparse>();
+        assert!(
+            advanced(&world),
+            "removing a value moves the last one into its slot"
+        );
+        world.entity_mut(first).insert(Sparse);
+        assert!(advanced(&world));
+        world.despawn(second);
+        assert!(advanced(&world), "despawning removes the value");
+        world.clear_entities();
+        assert!(advanced(&world), "clearing drops every value");
+    }
 
     #[test]
     fn sparse_set() {
