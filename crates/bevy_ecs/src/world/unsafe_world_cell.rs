@@ -772,16 +772,7 @@ impl<'w> UnsafeWorldCell<'w> {
         if storage_type == StorageType::SparseSet {
             // SAFETY: Only the set's structure version is read.
             let set = unsafe { self.fetch_sparse_set(component_id) }?;
-            let version = set.structure_version();
-            cache.0 = Some(CachedResourcePointers {
-                seen: version.load(Ordering::Relaxed),
-                version: version.clone(),
-                // SAFETY: `Ptr` is never null.
-                value: unsafe { NonNull::new_unchecked(value.as_ptr().cast_mut()) },
-                added: NonNull::from(cells.added),
-                changed: NonNull::from(cells.changed),
-                changed_by: cells.changed_by.map(NonNull::from),
-            });
+            cache.0 = Some(CachedResourcePointers::new(set, value, &cells));
         }
         Some((value, cells))
     }
@@ -1526,6 +1517,7 @@ impl ContainsEntity for UnsafeEntityCell<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     #[should_panic = "is forbidden"]
@@ -1538,6 +1530,73 @@ mod tests {
 
     #[derive(Resource)]
     struct R;
+
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct Stored(u32);
+
+    /// Pointers cached for `entity`, re-read from its sparse set whenever they went stale.
+    fn resolve(
+        world: &World,
+        entity: Entity,
+        cache: &mut Option<CachedResourcePointers>,
+    ) -> (bool, *const u8, u32) {
+        let id = world.component_id::<Stored>().unwrap();
+        let set = world.storages().sparse_sets.get(id).unwrap();
+        let reused = cache
+            .as_ref()
+            .is_some_and(CachedResourcePointers::is_current);
+        if !reused {
+            let (value, cells) = set.get_with_ticks(entity).unwrap();
+            *cache = Some(CachedResourcePointers::new(set, value, &cells));
+        }
+        // SAFETY: The pointers are current and `world` is borrowed shared.
+        let (value, _) = unsafe { cache.as_ref().unwrap().cells() };
+        let expected = set.get_with_ticks(entity).unwrap().0.as_ptr();
+        assert_eq!(
+            value.as_ptr(),
+            expected,
+            "cached pointer addresses the live value"
+        );
+        // SAFETY: `value` points to a live `Stored`.
+        (reused, value.as_ptr(), unsafe { value.deref::<Stored>() }.0)
+    }
+
+    #[test]
+    fn cached_pointers_follow_reallocation_and_swap_removal() {
+        let mut world = World::new();
+        let early: Vec<_> = (0..4).map(|i| world.spawn(Stored(i)).id()).collect();
+        let tracked = world.spawn(Stored(7)).id();
+        let mut cache = None;
+        let (reused, _, value) = resolve(&world, tracked, &mut cache);
+        assert!(!reused);
+        assert_eq!(value, 7);
+        assert!(
+            resolve(&world, tracked, &mut cache).0,
+            "unchanged storage reuses the pointers"
+        );
+
+        // Growing well past the initial capacity reallocates the dense storage.
+        let (_, before, _) = resolve(&world, tracked, &mut cache);
+        let grown: Vec<_> = (0..100)
+            .map(|i| world.spawn(Stored(100 + i)).id())
+            .collect();
+        let (reused, after, value) = resolve(&world, tracked, &mut cache);
+        assert!(!reused);
+        assert_ne!(before, after, "the storage moved");
+        assert_eq!(value, 7);
+
+        // Removing values before it swaps the last stored value into their slots.
+        for entity in grown.into_iter().rev() {
+            world.despawn(entity);
+        }
+        let (_, before, _) = resolve(&world, tracked, &mut cache);
+        world.despawn(early[0]);
+        let (reused, after, value) = resolve(&world, tracked, &mut cache);
+        assert!(!reused);
+        assert_ne!(before, after, "the value was relocated");
+        assert_eq!(value, 7);
+    }
 
     #[test]
     #[should_panic = "is forbidden"]
@@ -1586,6 +1645,20 @@ unsafe impl Send for CachedResourcePointers {}
 unsafe impl Sync for CachedResourcePointers {}
 
 impl CachedResourcePointers {
+    /// Keeps pointers just read from `set` together with its current structure version.
+    fn new(set: &ComponentSparseSet, value: Ptr<'_>, cells: &ComponentTickCells<'_>) -> Self {
+        let version = set.structure_version();
+        Self {
+            seen: version.load(Ordering::Relaxed),
+            version: version.clone(),
+            // SAFETY: `Ptr` is never null.
+            value: unsafe { NonNull::new_unchecked(value.as_ptr().cast_mut()) },
+            added: NonNull::from(cells.added),
+            changed: NonNull::from(cells.changed),
+            changed_by: cells.changed_by.map(NonNull::from),
+        }
+    }
+
     /// Whether the sparse set holding the resource is unchanged since the pointers were read.
     #[inline]
     fn is_current(&self) -> bool {

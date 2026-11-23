@@ -197,10 +197,16 @@ impl ComponentSparseSet {
     }
 
     /// Marks every pointer into this set's storage as stale.
+    ///
+    /// Besides structural changes, resource hooks call this when a resource stops being reachable
+    /// through the world's resource map while its value is still stored.
     #[inline]
-    fn advance_structure_version(&self) {
-        // Structural changes need `&mut self`, so a relaxed increment cannot race a reader.
-        self.structure_version.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn advance_structure_version(&self) {
+        // Every caller holds exclusive world access, so a plain load and store cannot race a
+        // reader or another writer, and avoids a locked read-modify-write on every insert.
+        let version = self.structure_version.load(Ordering::Relaxed);
+        self.structure_version
+            .store(version.wrapping_add(1), Ordering::Relaxed);
     }
 
     /// Removes all of the values stored within.

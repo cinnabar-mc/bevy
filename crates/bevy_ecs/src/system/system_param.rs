@@ -2868,6 +2868,8 @@ mod tests {
 
     use super::*;
     use crate::change_detection::{DetectChanges, Mut};
+    use crate::lifecycle::Remove;
+    use crate::observer::On;
     use crate::query::Without;
     use crate::resource::IsResource;
     use crate::schedule::Schedule;
@@ -2894,21 +2896,90 @@ mod tests {
         assert_eq!(system.run((), &mut world).unwrap(), Some(3));
     }
 
-    #[test]
-    fn res_fetch_follows_storage_grown_by_rejected_duplicates() {
-        let mut world = World::new();
+    /// What a cached `Option<Res<Cached>>` fetch sees, next to what a fresh, uncached one sees.
+    fn cached_and_fresh(
+        cached: &mut impl System<In = (), Out = Option<u32>>,
+        world: &mut World,
+    ) -> (Option<u32>, Option<u32>) {
+        let mut fresh = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        fresh.initialize(world);
+        (
+            cached.run((), world).unwrap(),
+            fresh.run((), world).unwrap(),
+        )
+    }
+
+    fn read_cached(world: &mut World) -> impl System<In = (), Out = Option<u32>> {
         let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
-        system.initialize(&mut world);
+        system.initialize(world);
+        system
+    }
+
+    #[test]
+    fn res_fetch_misses_a_resource_whose_marker_was_removed() {
+        #[derive(Resource)]
+        struct Other;
+        #[derive(Resource, Default)]
+        struct Seen(Vec<Option<u32>>);
+
+        let mut world = World::new();
+        world.insert_resource(Cached(1));
+        world.insert_resource(Other);
+        world.init_resource::<Seen>();
+        world.add_observer(
+            |_: On<Remove<IsResource>>, value: Option<Res<Cached>>, mut seen: ResMut<Seen>| {
+                seen.0.push(value.map(|v| v.0));
+            },
+        );
+        let entity_of = |world: &World, id| world.resource_entities().get(id).unwrap();
+        let other = entity_of(&world, world.component_id::<Other>().unwrap());
+        let cached = entity_of(&world, world.component_id::<Cached>().unwrap());
+        // The first removal warms the observer's fetch while the resource is reachable.
+        world.entity_mut(other).remove::<IsResource>();
+        // Unregistering the resource hides it before its value is removed.
+        world.entity_mut(cached).remove::<IsResource>();
+        assert_eq!(world.resource::<Seen>().0, [Some(1), None]);
+    }
+
+    #[test]
+    fn res_fetch_follows_cleared_entities() {
+        let mut world = World::new();
         world.insert_resource(Cached(7));
-        assert_eq!(system.run((), &mut world).unwrap(), Some(7));
-        // Each duplicate is stored beside the resource, growing its storage, until the queued
-        // removal rejects it.
-        for i in 0..64 {
-            world.spawn(Cached(1000 + i));
-            assert_eq!(system.run((), &mut world).unwrap(), Some(7));
-        }
-        world.flush();
-        assert_eq!(system.run((), &mut world).unwrap(), Some(7));
+        let mut system = read_cached(&mut world);
+        assert_eq!(
+            cached_and_fresh(&mut system, &mut world),
+            (Some(7), Some(7))
+        );
+        world.clear_entities();
+        let (cached, fresh) = cached_and_fresh(&mut system, &mut world);
+        assert_eq!(cached, fresh);
+    }
+
+    #[test]
+    fn res_fetch_survives_moving_and_swapping_the_world() {
+        let mut world = World::new();
+        world.insert_resource(Cached(3));
+        let mut system = read_cached(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), Some(3));
+        // Extraction moves the main world in and out of another world's resource like this.
+        let mut moved = core::mem::take(&mut world);
+        assert_eq!(system.run((), &mut moved).unwrap(), Some(3));
+        let mut holder = Some(moved);
+        let mut world = holder.take().unwrap();
+        world.resource_mut::<Cached>().0 = 4;
+        assert_eq!(system.run((), &mut world).unwrap(), Some(4));
+    }
+
+    #[test]
+    #[should_panic = "Encountered a mismatched World"]
+    fn res_fetch_state_rejects_another_world() {
+        let mut first = World::new();
+        first.insert_resource(Cached(1));
+        let mut system = read_cached(&mut first);
+        system.run((), &mut first).unwrap();
+        let mut second = World::new();
+        second.insert_resource(Cached(2));
+        let _ = system.run((), &mut second);
     }
 
     #[test]

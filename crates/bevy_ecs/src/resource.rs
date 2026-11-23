@@ -178,6 +178,7 @@ impl IsResource {
             // We only expose `&ResourceCache` to code with access to a resource (such as `&World`),
             // and that would conflict with the `DeferredWorld` passed to the resource hook.
             unsafe { &mut *cache.0.get() }.insert(resource_component_id, context.entity);
+            invalidate_resource_pointers(&world, resource_component_id);
         }
     }
 
@@ -197,6 +198,9 @@ impl IsResource {
             // We only expose `&ResourceCache` to code with access to a resource (such as `&World`),
             // and that would conflict with the `DeferredWorld` passed to the resource hook.
             unsafe { &mut *cache.0.get() }.remove(resource_component_id);
+            // The value stays stored until the queued removal runs, but lookups through the map
+            // already fail, so cached parameter pointers must not outlive the map entry.
+            invalidate_resource_pointers(&world, resource_component_id);
 
             world
                 .commands()
@@ -207,6 +211,13 @@ impl IsResource {
 
     pub(crate) fn on_despawn(_world: DeferredWorld, _context: HookContext) {
         warn!("Resource entities are not supposed to be despawned.");
+    }
+}
+
+/// Makes system parameters that cached pointers to the resource `component_id` look it up again.
+fn invalidate_resource_pointers(world: &DeferredWorld, component_id: ComponentId) {
+    if let Some(set) = world.storages().sparse_sets.get(component_id) {
+        set.advance_structure_version();
     }
 }
 
