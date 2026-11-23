@@ -40,8 +40,8 @@ use bevy_ecs::{
     reflect::ReflectComponent,
     resource::Resource,
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
-    system::{Commands, Query, Res, ResMut},
-    world::DeferredWorld,
+    system::{Commands, EntityCommand, Query, Res, ResMut},
+    world::{DeferredWorld, EntityWorldMut},
 };
 use bevy_image::Image;
 use bevy_log::warn;
@@ -631,7 +631,7 @@ pub fn extract_cameras(
             main_pass_formats.insert(render_entity, target_format);
 
             let mut commands = commands.entity(render_entity);
-            commands.insert((
+            commands.queue(write_camera_components((
                 ExtractedCamera {
                     target,
                     viewport: camera.viewport.clone(),
@@ -667,30 +667,30 @@ pub fn extract_cameras(
                 },
                 render_visible_entities_cpu_culling,
                 *frustum,
-            ));
+            )));
 
             if let Some(temporal_jitter) = temporal_jitter {
                 commands.insert(temporal_jitter.clone());
             } else {
-                commands.remove::<TemporalJitter>();
+                commands.queue(remove_if_present::<TemporalJitter>);
             }
 
             if let Some(mip_bias) = mip_bias {
                 commands.insert(mip_bias.clone());
             } else {
-                commands.remove::<MipBias>();
+                commands.queue(remove_if_present::<MipBias>);
             }
 
             if let Some(render_layers) = render_layers {
                 commands.insert(render_layers.clone());
             } else {
-                commands.remove::<RenderLayers>();
+                commands.queue(remove_if_present::<RenderLayers>);
             }
 
             if let Some(projection) = projection {
                 commands.insert(projection.clone());
             } else {
-                commands.remove::<Projection>();
+                commands.queue(remove_if_present::<Projection>);
             }
 
             if no_indirect_drawing
@@ -704,6 +704,48 @@ pub fn extract_cameras(
                 commands.remove::<NoIndirectDrawing>();
             }
         };
+    }
+}
+
+/// The components [`extract_cameras`] writes to an active render camera every frame.
+type CameraComponents = (
+    ExtractedCamera,
+    ResolvedCompositingSpace,
+    ExtractedView,
+    RenderExtractedVisibleEntities,
+    Frustum,
+);
+
+/// Writes this frame's [`CameraComponents`] when the command applies. A render camera that
+/// already has all of them gets them assigned in place: the same values, marked changed at the
+/// same tick, without the bundle insert's lookups or its replace and insert hooks and observers,
+/// none of which are registered for these components. Otherwise they are inserted.
+fn write_camera_components(components: CameraComponents) -> impl EntityCommand<Out = ()> {
+    move |mut entity: EntityWorldMut| {
+        if !(entity.contains::<ExtractedCamera>()
+            && entity.contains::<ResolvedCompositingSpace>()
+            && entity.contains::<ExtractedView>()
+            && entity.contains::<RenderExtractedVisibleEntities>()
+            && entity.contains::<Frustum>())
+        {
+            entity.insert(components);
+            return;
+        }
+        let (camera, compositing_space, view, visible_entities, frustum) = components;
+        // The checks above guarantee each component is present.
+        *entity.get_mut::<ExtractedCamera>().unwrap() = camera;
+        *entity.get_mut::<ResolvedCompositingSpace>().unwrap() = compositing_space;
+        *entity.get_mut::<ExtractedView>().unwrap() = view;
+        *entity.get_mut::<RenderExtractedVisibleEntities>().unwrap() = visible_entities;
+        *entity.get_mut::<Frustum>().unwrap() = frustum;
+    }
+}
+
+/// Removes `T` when the command applies, if the entity has it. Removing an absent component has
+/// no effect, so this only skips the removal's bundle lookup.
+fn remove_if_present<T: Component>(mut entity: EntityWorldMut) {
+    if entity.contains::<T>() {
+        entity.remove::<T>();
     }
 }
 
@@ -1201,6 +1243,89 @@ mod tests {
             exposure: 1.0,
             hdr,
         }
+    }
+
+    fn camera_components(order: isize) -> CameraComponents {
+        (
+            extracted_camera(
+                order,
+                false,
+                NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+            ),
+            ResolvedCompositingSpace(None),
+            ExtractedView {
+                retained_view_entity: RetainedViewEntity::new(
+                    MainEntity::from(Entity::PLACEHOLDER),
+                    None,
+                    0,
+                ),
+                clip_from_view: Mat4::IDENTITY,
+                world_from_view: GlobalTransform::IDENTITY,
+                clip_from_world: None,
+                target_format: TextureFormat::Rgba8Unorm,
+                viewport: UVec4::new(0, 0, 1, 1),
+                color_grading: ColorGrading::default(),
+                invert_culling: false,
+            },
+            RenderExtractedVisibleEntities::default(),
+            Frustum::default(),
+        )
+    }
+
+    #[test]
+    fn camera_components_written_in_place_match_a_reinsertion() {
+        use bevy_ecs::{change_detection::DetectChanges, world::CommandQueue};
+
+        let mut world = World::new();
+        let fresh = world.spawn_empty().id();
+        let reinserted = world.spawn(camera_components(1)).id();
+        let assigned = world.spawn(camera_components(1)).id();
+        world.increment_change_tick();
+
+        let mut queue = CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        commands
+            .entity(fresh)
+            .queue(write_camera_components(camera_components(2)));
+        commands.entity(reinserted).insert(camera_components(2));
+        commands
+            .entity(assigned)
+            .queue(write_camera_components(camera_components(2)));
+        queue.apply(&mut world);
+
+        for entity in [fresh, reinserted, assigned] {
+            assert_eq!(world.get::<ExtractedCamera>(entity).unwrap().order, 2);
+        }
+        let ticks = |entity: Entity| {
+            let camera = world.entity(entity).get_ref::<ExtractedCamera>().unwrap();
+            let view = world.entity(entity).get_ref::<ExtractedView>().unwrap();
+            (
+                camera.added(),
+                camera.last_changed(),
+                view.added(),
+                view.last_changed(),
+            )
+        };
+        assert_eq!(ticks(assigned), ticks(reinserted));
+        assert_ne!(
+            ticks(fresh).0,
+            ticks(reinserted).0,
+            "a first write adds the components"
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_component_is_skipped_and_a_present_one_removed() {
+        let mut world = World::new();
+        let with = world.spawn(MipBias(1.0)).id();
+        let without = world.spawn_empty().id();
+        remove_if_present::<MipBias>(world.entity_mut(with));
+        remove_if_present::<MipBias>(world.entity_mut(without));
+        assert!(!world.entity(with).contains::<MipBias>());
+        assert!(!world.entity(without).contains::<MipBias>());
     }
 
     #[test]
