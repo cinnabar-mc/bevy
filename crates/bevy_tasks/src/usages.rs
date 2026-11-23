@@ -78,7 +78,9 @@ taskpool! {
 crate::cfg::web! {
     if {} else {
         /// A function used by `bevy_app` to tick the global tasks pools on the main thread.
-        /// This will run a maximum of 100 local tasks per executor per call to this function.
+        /// This will run a maximum of 100 local tasks per executor per call to this function,
+        /// one per executor per round, and stops after a round in which none of them had a
+        /// runnable task: tasks woken by the tasks that ran are already queued by then.
         ///
         /// # Warning
         ///
@@ -97,13 +99,78 @@ crate::cfg::web! {
                                 .unwrap()
                                 .with_local_executor(|io_local_executor| {
                                     for _ in 0..100 {
-                                        compute_local_executor.try_tick();
-                                        async_local_executor.try_tick();
-                                        io_local_executor.try_tick();
+                                        // Non-short-circuiting, so every executor ticks once
+                                        // per round as before.
+                                        let ran = compute_local_executor.try_tick()
+                                            | async_local_executor.try_tick()
+                                            | io_local_executor.try_tick();
+                                        if !ran {
+                                            break;
+                                        }
                                     }
                                 });
                         });
                 });
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    /// Wakes itself on every poll, counting polls, until it has been polled `limit` times.
+    struct Spin {
+        polls: Arc<AtomicUsize>,
+        limit: usize,
+    }
+
+    impl Future for Spin {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.polls.fetch_add(1, Ordering::Relaxed) + 1 >= self.limit {
+                return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn main_thread_tick_runs_queued_local_work_and_later_wakes() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
+        IoTaskPool::get_or_init(TaskPool::default);
+
+        // A task that keeps waking itself runs until it finishes.
+        let polls = Arc::new(AtomicUsize::new(0));
+        ComputeTaskPool::get()
+            .spawn_local(Spin {
+                polls: Arc::clone(&polls),
+                limit: 50,
+            })
+            .detach();
+        tick_global_task_pools_on_main_thread();
+        assert_eq!(polls.load(Ordering::Relaxed), 50);
+
+        // With nothing queued the call returns, and work spawned afterwards runs on the next one.
+        tick_global_task_pools_on_main_thread();
+        let later = Arc::new(AtomicUsize::new(0));
+        IoTaskPool::get()
+            .spawn_local(Spin {
+                polls: Arc::clone(&later),
+                limit: 5,
+            })
+            .detach();
+        tick_global_task_pools_on_main_thread();
+        assert_eq!(later.load(Ordering::Relaxed), 5);
     }
 }

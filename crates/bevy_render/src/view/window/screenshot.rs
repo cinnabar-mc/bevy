@@ -252,8 +252,14 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-fn clear_screenshots(mut commands: Commands) {
-    commands.despawn_all::<With<Captured>>();
+/// Despawns last frame's captured screenshots. Only [`trigger_screenshots`] adds [`Captured`],
+/// in `Update`, so no captured entity can appear between this system and the `ApplyDeferred`
+/// it runs before; with none present, the despawn command (which builds a query each time)
+/// is not queued.
+fn clear_screenshots(mut commands: Commands, captured: Query<(), With<Captured>>) {
+    if !captured.is_empty() {
+        commands.despawn_all::<With<Captured>>();
+    }
 }
 
 pub fn trigger_screenshots(
@@ -901,5 +907,26 @@ mod recovery_tests {
             .despawn();
         world.run_system_once(extract_screenshots).unwrap();
         assert!(world.resource::<RenderScreenshotTargets>().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::schedule::Schedule;
+
+    #[test]
+    fn clearing_despawns_only_captured_screenshots() {
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(clear_screenshots);
+        let kept = world.spawn_empty().id();
+        schedule.run(&mut world);
+        assert!(world.get_entity(kept).is_ok());
+
+        let captured = world.spawn(Captured).id();
+        schedule.run(&mut world);
+        assert!(world.get_entity(captured).is_err());
+        assert!(world.get_entity(kept).is_ok());
     }
 }
