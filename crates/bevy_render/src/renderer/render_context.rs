@@ -881,6 +881,38 @@ mod tests {
         );
     }
 
+    /// The queue's submission counter, read from an index's debug form.
+    fn submission_number(index: &SubmissionIndex) -> u64 {
+        format!("{index:?}")
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("submission index")
+    }
+
+    #[test]
+    fn a_later_submission_replaces_one_not_yet_taken() {
+        let mut world = world();
+        let mut schedule = schedule(Outer, true);
+        schedule.add_systems(encode);
+        let queue = world.resource::<RenderQueue>().clone();
+        // An early flush, then the graph's own submission, before anything takes the index.
+        schedule.run(&mut world);
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit(&queue);
+        schedule.run(&mut world);
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit(&queue);
+        let marker = queue.submit([]);
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        let taken = pending.take_submission().expect("the graph's submission");
+        assert_eq!(submission_number(&taken) + 1, submission_number(&marker));
+        assert!(pending.take_submission().is_none());
+    }
+
     #[test]
     fn exclusive_systems_record_into_the_frame_encoder() {
         let mut world = world();
