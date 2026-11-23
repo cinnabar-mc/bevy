@@ -2881,6 +2881,32 @@ mod tests {
     struct Cached(u32);
 
     #[test]
+    fn res_fetch_keeps_its_pointers_across_removal_and_reinsertion() {
+        let mut world = World::new();
+        world.insert_resource(Cached(1));
+        let id = world.component_id::<Cached>().unwrap();
+        let mut system = IntoSystem::into_system(|value: Res<Cached>| value.0);
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 1);
+        let version = |world: &World| {
+            world
+                .storages()
+                .sparse_sets
+                .get(id)
+                .unwrap()
+                .structure_version()
+                .load(core::sync::atomic::Ordering::Relaxed)
+        };
+        let before = version(&world);
+        // Extraction moves a resource out and back in every frame; nothing else in its storage
+        // moves, so cached fetches stay valid and see the new value.
+        let taken = world.remove_resource::<Cached>().unwrap();
+        world.insert_resource(Cached(taken.0 + 1));
+        assert_eq!(version(&world), before);
+        assert_eq!(system.run((), &mut world).unwrap(), 2);
+    }
+
+    #[test]
     fn res_fetch_follows_removal_and_reinsertion() {
         let mut world = World::new();
         let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));

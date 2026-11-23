@@ -132,6 +132,21 @@ impl<I: SparseSetIndex, V> SparseArray<I, V> {
         self.values.clear();
     }
 
+    /// The number of indexes the array can hold without reallocating.
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
+    /// The address of the slot for `index`, if `index` is within the array. The address stays
+    /// valid until the array reallocates or is cleared.
+    #[inline]
+    pub(crate) fn slot(&self, index: I) -> Option<core::ptr::NonNull<Option<V>>> {
+        self.values
+            .get(index.sparse_set_index())
+            .map(core::ptr::NonNull::from)
+    }
+
     /// Converts the [`SparseArray`] into an immutable variant.
     pub(crate) fn into_immutable(self) -> ImmutableSparseArray<I, V> {
         ImmutableSparseArray {
@@ -169,8 +184,11 @@ pub struct ComponentSparseSet {
     #[cfg(debug_assertions)]
     entities: Vec<Entity>,
     sparse: SparseArray<EntityIndex, TableRow>,
-    /// Advances whenever a value is added, removed or moved, so pointers into this set's storage
-    /// that were read at one version stay valid while the version is unchanged.
+    /// Advances whenever stored values move: the dense storage or the sparse array reallocates, a
+    /// removal swaps another value into the freed row, or the set is cleared. Adding a value
+    /// without reallocating or removing the last row moves nothing. A pointer read for an entity
+    /// stays valid while the version is unchanged and that entity's sparse slot still holds the
+    /// row it was read at.
     structure_version: Arc<AtomicU64>,
 }
 
@@ -187,13 +205,26 @@ impl ComponentSparseSet {
         }
     }
 
-    /// The counter that advances whenever a value in this set is added, removed or moved.
+    /// The counter that advances whenever values stored in this set move.
     ///
-    /// Pointers returned by [`Self::get_with_ticks`] keep addressing the same entity's value and
-    /// change ticks while the counter holds the value it had when they were read.
+    /// Pointers returned by [`Self::get_with_ticks`] for an entity keep addressing that entity's
+    /// value and change ticks while the counter holds the value it had when they were read and
+    /// [`Self::sparse_slot`] of the entity still holds the same row.
     #[inline]
     pub(crate) fn structure_version(&self) -> &Arc<AtomicU64> {
         &self.structure_version
+    }
+
+    /// The row of `entity`'s value with the address of its sparse slot, which holds `Some(row)`
+    /// while the value stays at that row. The address stays valid while
+    /// [`Self::structure_version`] is unchanged.
+    #[inline]
+    pub(crate) fn sparse_slot(
+        &self,
+        entity: Entity,
+    ) -> Option<(core::ptr::NonNull<Option<TableRow>>, TableRow)> {
+        let row = *self.sparse.get(entity.index())?;
+        Some((self.sparse.slot(entity.index())?, row))
     }
 
     /// Marks every pointer into this set's storage as stale.
@@ -252,9 +283,9 @@ impl ComponentSparseSet {
             assert_eq!(entity, self.entities[dense_index.index()]);
             self.dense.replace(dense_index, value, change_tick, caller);
         } else {
-            self.advance_structure_version();
             let dense_index = self.entities.len();
             let capacity = self.entities.capacity();
+            let sparse_capacity = self.sparse.capacity();
 
             #[cfg(not(debug_assertions))]
             self.entities.push(entity.index());
@@ -266,6 +297,7 @@ impl ComponentSparseSet {
             // We create an AbortOnPanic guard to force panics to terminate the process if this occurs.
             let _guard = AbortOnPanic;
             if capacity != self.entities.capacity() {
+                self.advance_structure_version();
                 // SAFETY: An entity was just pushed onto `entities`, its capacity cannot be zero.
                 let new_capacity = unsafe { NonZero::new_unchecked(self.entities.capacity()) };
                 if let Some(capacity) = NonZero::new(capacity) {
@@ -281,6 +313,9 @@ impl ComponentSparseSet {
             let table_row = unsafe { TableRow::new(NonMaxU32::new_unchecked(dense_index as u32)) };
             self.dense.initialize(table_row, value, change_tick, caller);
             self.sparse.insert(entity.index(), table_row);
+            if sparse_capacity != self.sparse.capacity() {
+                self.advance_structure_version();
+            }
 
             core::mem::forget(_guard);
         }
@@ -403,7 +438,6 @@ impl ComponentSparseSet {
     #[must_use = "The returned pointer must be used to drop the removed component."]
     pub(crate) fn remove_and_forget(&mut self, entity: Entity) -> Option<OwningPtr<'_>> {
         self.sparse.remove(entity.index()).map(|dense_index| {
-            self.advance_structure_version();
             #[cfg(debug_assertions)]
             assert_eq!(entity, self.entities[dense_index.index()]);
             let last = self.entities.len() - 1;
@@ -422,6 +456,8 @@ impl ComponentSparseSet {
                         .promote()
                 }
             } else {
+                // The last value moves into the freed row.
+                self.advance_structure_version();
                 // SAFETY: The above check ensures that `dense_index` and the last element are not
                 // overlapping, and thus also within bounds.
                 unsafe {
@@ -456,7 +492,6 @@ impl ComponentSparseSet {
         self.sparse
             .remove(entity.index())
             .map(|dense_index| {
-                self.advance_structure_version();
                 #[cfg(debug_assertions)]
                 assert_eq!(entity, self.entities[dense_index.index()]);
                 let last = self.entities.len() - 1;
@@ -470,6 +505,8 @@ impl ComponentSparseSet {
                     // the `entities` store.
                     unsafe { self.dense.drop_last_component(last) };
                 } else {
+                    // The last value moves into the freed row.
+                    self.advance_structure_version();
                     // SAFETY: The above check ensures that `dense_index` and the last element are not
                     // overlapping, and thus also within bounds.
                     unsafe {
@@ -896,7 +933,7 @@ mod tests {
     struct Foo(usize);
 
     #[test]
-    fn structure_version_advances_on_every_structural_change() {
+    fn structure_version_advances_when_stored_values_move() {
         use crate::world::World;
         use core::sync::atomic::Ordering;
 
@@ -929,20 +966,30 @@ mod tests {
             !advanced(&world),
             "replacing a value in place keeps pointers valid"
         );
-        let second = world.spawn(Sparse).id();
+        // Values added within capacity move nothing; growing past it reallocates.
+        let mut added = Vec::new();
+        let mut grew = false;
+        for _ in 0..64 {
+            added.push(world.spawn(Sparse).id());
+            grew |= advanced(&world);
+        }
+        assert!(grew, "growing the storage reallocates it");
+        let second = *added.last().unwrap();
+        world.entity_mut(second).remove::<Sparse>();
+        assert!(!advanced(&world), "removing the last row moves nothing");
+        world.entity_mut(second).insert(Sparse);
         assert!(
-            advanced(&world),
-            "adding a value can reallocate the storage"
+            !advanced(&world),
+            "adding within capacity and the sparse array moves nothing"
         );
         world.entity_mut(first).remove::<Sparse>();
         assert!(
             advanced(&world),
-            "removing a value moves the last one into its slot"
+            "removing an earlier row moves the last value into it"
         );
         world.entity_mut(first).insert(Sparse);
-        assert!(advanced(&world));
-        world.despawn(second);
-        assert!(advanced(&world), "despawning removes the value");
+        world.despawn(added[0]);
+        assert!(advanced(&world), "despawning swaps the last value in");
         world.clear_entities();
         assert!(advanced(&world), "clearing drops every value");
     }
