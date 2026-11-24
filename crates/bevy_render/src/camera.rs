@@ -29,6 +29,7 @@ use bevy_camera::{
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
+    archetype::{Archetype, ArchetypeId},
     change_detection::DetectChanges,
     component::Component,
     entity::{ContainsEntity, Entity, EntityHashMap, EntityHashSet},
@@ -40,7 +41,7 @@ use bevy_ecs::{
     reflect::ReflectComponent,
     resource::Resource,
     schedule::{InternedScheduleLabel, IntoScheduleConfigs, ScheduleLabel, SystemSet},
-    system::{Commands, EntityCommand, Query, Res, ResMut},
+    system::{Commands, EntityCommand, EntityCommands, Query, Res, ResMut},
     world::{DeferredWorld, EntityWorldMut},
 };
 use bevy_image::Image;
@@ -669,29 +670,10 @@ pub fn extract_cameras(
                 *frustum,
             )));
 
-            if let Some(temporal_jitter) = temporal_jitter {
-                commands.insert(temporal_jitter.clone());
-            } else {
-                commands.queue(remove_if_present::<TemporalJitter>);
-            }
-
-            if let Some(mip_bias) = mip_bias {
-                commands.insert(mip_bias.clone());
-            } else {
-                commands.queue(remove_if_present::<MipBias>);
-            }
-
-            if let Some(render_layers) = render_layers {
-                commands.insert(render_layers.clone());
-            } else {
-                commands.queue(remove_if_present::<RenderLayers>);
-            }
-
-            if let Some(projection) = projection {
-                commands.insert(projection.clone());
-            } else {
-                commands.queue(remove_if_present::<Projection>);
-            }
+            write_optional(&mut commands, temporal_jitter);
+            write_optional(&mut commands, mip_bias);
+            write_optional(&mut commands, render_layers);
+            write_optional(&mut commands, projection);
 
             if no_indirect_drawing
                 || !matches!(
@@ -716,31 +698,71 @@ type CameraComponents = (
     Frustum,
 );
 
-/// Writes this frame's [`CameraComponents`] when the command applies. A render camera that
-/// already has all of them, and the [`RenderVisibleEntities`] that [`ExtractedCamera`] requires,
-/// gets them assigned in place: the same values, marked changed at the same tick, without the
-/// bundle insert's lookups or its replace and insert hooks and observers. None are registered for
-/// these components; an `Insert` observer added for one would only see the first extraction.
-/// Otherwise they are inserted, which also restores any missing required component.
+/// The archetype a render camera was in right after [`write_camera_components`] inserted its
+/// bundle, or `None` if that archetype was missing one of the bundle's components.
+#[derive(Component)]
+struct WrittenCameraArchetype(Option<ArchetypeId>);
+
+/// Writes this frame's [`CameraComponents`] when the command applies.
+///
+/// After a bundle insert that left the camera with every component the bundle contributes,
+/// including required components registered by plugins, the camera's archetype is recorded.
+/// While the camera stays in that archetype it still has all of them, so the next writes assign
+/// in place: the same values, marked changed at the same tick, without the bundle insert's
+/// lookups or its replace and insert hooks and observers. None are registered for these
+/// components; an `Insert` observer added for one would only see the first extraction. Adding or
+/// removing any component moves the camera to another archetype, and the next write inserts the
+/// bundle again, which also restores any missing required component.
 fn write_camera_components(components: CameraComponents) -> impl EntityCommand<Out = ()> {
     move |mut entity: EntityWorldMut| {
-        if !(entity.contains::<ExtractedCamera>()
-            && entity.contains::<ResolvedCompositingSpace>()
-            && entity.contains::<ExtractedView>()
-            && entity.contains::<RenderExtractedVisibleEntities>()
-            && entity.contains::<Frustum>()
-            && entity.contains::<RenderVisibleEntities>())
+        let archetype = entity.archetype().id();
+        if entity
+            .get::<WrittenCameraArchetype>()
+            .is_some_and(|written| written.0 == Some(archetype))
         {
-            entity.insert(components);
+            let (camera, compositing_space, view, visible_entities, frustum) = components;
+            // The recorded archetype holds every component of the bundle.
+            *entity.get_mut::<ExtractedCamera>().unwrap() = camera;
+            *entity.get_mut::<ResolvedCompositingSpace>().unwrap() = compositing_space;
+            *entity.get_mut::<ExtractedView>().unwrap() = view;
+            *entity.get_mut::<RenderExtractedVisibleEntities>().unwrap() = visible_entities;
+            *entity.get_mut::<Frustum>().unwrap() = frustum;
             return;
         }
-        let (camera, compositing_space, view, visible_entities, frustum) = components;
-        // The checks above guarantee each component is present.
-        *entity.get_mut::<ExtractedCamera>().unwrap() = camera;
-        *entity.get_mut::<ResolvedCompositingSpace>().unwrap() = compositing_space;
-        *entity.get_mut::<ExtractedView>().unwrap() = view;
-        *entity.get_mut::<RenderExtractedVisibleEntities>().unwrap() = visible_entities;
-        *entity.get_mut::<Frustum>().unwrap() = frustum;
+        entity.insert((components, WrittenCameraArchetype(None)));
+        // An observer may have despawned the camera or changed its components during the insert.
+        let Some(archetype) = entity.try_archetype().map(Archetype::id) else {
+            return;
+        };
+        let complete = entity.world_scope(|world| {
+            let bundle = world.register_bundle::<CameraComponents>().id();
+            let contributed = world
+                .bundles()
+                .get(bundle)
+                .unwrap()
+                .contributed_components();
+            let archetype = &world.archetypes()[archetype];
+            contributed
+                .iter()
+                .all(|&component| archetype.contains(component))
+        });
+        if complete && let Some(mut written) = entity.get_mut::<WrittenCameraArchetype>() {
+            written.0 = Some(archetype);
+        }
+    }
+}
+
+/// Inserts `value` when the extracted camera has one, and otherwise removes `T` if present.
+/// Like [`EntityCommands::remove`], the removal warns instead of panicking when the camera was
+/// despawned before it applies, for example by an observer of an earlier insert.
+fn write_optional<T: Component + Clone>(commands: &mut EntityCommands, value: Option<&T>) {
+    match value {
+        Some(value) => {
+            commands.insert(value.clone());
+        }
+        None => {
+            commands.queue_handled(remove_if_present::<T>, bevy_ecs::error::warn);
+        }
     }
 }
 
@@ -1225,7 +1247,12 @@ impl PendingQueues {
 mod tests {
     use super::*;
     use bevy_app::Main;
-    use bevy_ecs::{system::RunSystemOnce, world::World};
+    use bevy_ecs::{
+        lifecycle::Insert,
+        observer::On,
+        system::RunSystemOnce,
+        world::{CommandQueue, World},
+    };
 
     fn extracted_camera(
         order: isize,
@@ -1280,12 +1307,13 @@ mod tests {
 
     #[test]
     fn camera_components_written_in_place_match_a_reinsertion() {
-        use bevy_ecs::{change_detection::DetectChanges, world::CommandQueue};
+        use bevy_ecs::change_detection::DetectChanges;
 
         let mut world = World::new();
         let fresh = world.spawn_empty().id();
         let reinserted = world.spawn(camera_components(1)).id();
-        let assigned = world.spawn(camera_components(1)).id();
+        let assigned = world.spawn_empty().id();
+        write(&mut world, assigned, camera_components(1));
         world.increment_change_tick();
 
         let mut queue = CommandQueue::default();
@@ -1320,10 +1348,75 @@ mod tests {
         );
     }
 
+    #[derive(Resource, Default)]
+    struct Inserts(usize);
+
+    fn count_inserts(_: On<Insert<ExtractedCamera>>, mut inserts: ResMut<Inserts>) {
+        inserts.0 += 1;
+    }
+
+    fn write(world: &mut World, camera: Entity, components: CameraComponents) {
+        let mut queue = CommandQueue::default();
+        Commands::new(&mut queue, world)
+            .entity(camera)
+            .queue(write_camera_components(components));
+        queue.apply(world);
+    }
+
+    /// A component a plugin requires on render cameras, outside the camera module's knowledge.
+    #[derive(Component, Default)]
+    struct PluginViewState;
+
+    #[test]
+    fn a_removed_plugin_required_component_is_restored_by_the_next_write() {
+        let mut world = World::new();
+        world.register_required_components::<RenderVisibleEntities, PluginViewState>();
+        let camera = world.spawn_empty().id();
+        write(&mut world, camera, camera_components(1));
+        write(&mut world, camera, camera_components(2));
+        world.entity_mut(camera).remove::<PluginViewState>();
+
+        write(&mut world, camera, camera_components(3));
+
+        assert!(world.entity(camera).contains::<PluginViewState>());
+        assert_eq!(world.get::<ExtractedCamera>(camera).unwrap().order, 3);
+    }
+
+    #[test]
+    fn a_camera_that_changed_archetype_is_inserted_again_then_assigned_in_place() {
+        let mut world = World::new();
+        world.init_resource::<Inserts>();
+        world.add_observer(count_inserts);
+        let camera = world.spawn_empty().id();
+        write(&mut world, camera, camera_components(1));
+        write(&mut world, camera, camera_components(2));
+        assert_eq!(world.resource::<Inserts>().0, 1);
+
+        world.entity_mut(camera).insert(MipBias(1.0));
+        write(&mut world, camera, camera_components(3));
+        write(&mut world, camera, camera_components(4));
+
+        assert_eq!(world.resource::<Inserts>().0, 2);
+        assert_eq!(world.get::<ExtractedCamera>(camera).unwrap().order, 4);
+    }
+
+    #[test]
+    fn removing_an_optional_component_from_a_despawned_camera_does_not_panic() {
+        let mut world = World::new();
+        let camera = world.spawn((camera_components(1), MipBias(1.0))).id();
+
+        let mut queue = CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        let mut entity = commands.entity(camera);
+        entity.despawn();
+        write_optional::<MipBias>(&mut entity, None);
+        queue.apply(&mut world);
+
+        assert!(world.get_entity(camera).is_err());
+    }
+
     #[test]
     fn a_removed_required_component_is_restored_by_the_next_write() {
-        use bevy_ecs::world::CommandQueue;
-
         let mut world = World::new();
         let camera = world.spawn(camera_components(1)).id();
         world.entity_mut(camera).remove::<RenderVisibleEntities>();
