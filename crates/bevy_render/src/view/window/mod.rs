@@ -145,7 +145,9 @@ fn extract_windows(
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
         // Render systems only filter on the marker; none reads its change ticks or observes its
-        // insertion, so a window that already has it needs no replacement every frame.
+        // insertion, so a window that already has it needs no replacement every frame. This
+        // system queues any removal of the marker after this insert itself; only another system
+        // removing it in the same flush would now leave it removed for a frame.
         if is_primary && !marked_primary.contains(render_entity) {
             commands.entity(render_entity).insert(PrimaryWindow);
         }

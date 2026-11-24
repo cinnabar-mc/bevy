@@ -21,7 +21,8 @@ use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget}
 use bevy_color::{ColorToPacked, LinearRgba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    entity::EntityHashMap, message::message_update_system, prelude::*, system::SystemState,
+    entity::EntityHashMap, entity_disabling::Disabled, message::message_update_system, prelude::*,
+    query::Allow, system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
 use bevy_log::{error, info, warn};
@@ -256,8 +257,12 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
 /// [`trigger_screenshots`], in `Update`, so no captured entity can appear between this system and
 /// the `ApplyDeferred` it runs before; with none present, the despawn command (which builds a query
 /// each time) is not queued. An app that queues `Captured` itself in `First`, ahead of that flush,
-/// has those entities despawned a frame later.
-fn clear_screenshots(mut commands: Commands, captured: Query<(), With<Captured>>) {
+/// has those entities despawned a frame later. Disabled captured entities count too, so a queued
+/// re-enable still finds the command queued.
+fn clear_screenshots(
+    mut commands: Commands,
+    captured: Query<(), (With<Captured>, Allow<Disabled>)>,
+) {
     if !captured.is_empty() {
         commands.despawn_all::<With<Captured>>();
     }
@@ -929,5 +934,20 @@ mod tests {
         schedule.run(&mut world);
         assert!(world.get_entity(captured).is_err());
         assert!(world.get_entity(kept).is_ok());
+
+        // A disabled capture re-enabled ahead of the flush is despawned in the same frame.
+        let disabled = world.spawn((Captured, Disabled)).id();
+        let mut reenable = Schedule::default();
+        reenable.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(disabled).remove::<Disabled>();
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        reenable.run(&mut world);
+        assert!(world.get_entity(disabled).is_err());
     }
 }
