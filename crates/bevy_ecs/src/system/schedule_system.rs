@@ -79,6 +79,11 @@ where
         self.system.apply_deferred(world);
     }
 
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.system.may_apply_deferred()
+    }
+
     fn queue_deferred(&mut self, world: DeferredWorld) {
         self.system.queue_deferred(world);
     }
@@ -168,6 +173,11 @@ where
 
     fn apply_deferred(&mut self, world: &mut World) {
         self.system.apply_deferred(world);
+    }
+
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.system.may_apply_deferred()
     }
 
     fn queue_deferred(&mut self, world: DeferredWorld) {

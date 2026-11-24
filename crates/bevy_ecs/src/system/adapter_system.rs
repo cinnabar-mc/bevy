@@ -158,6 +158,11 @@ where
     }
 
     #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.system.may_apply_deferred()
+    }
+
+    #[inline]
     fn queue_deferred(&mut self, world: crate::world::DeferredWorld) {
         self.system.queue_deferred(world);
     }

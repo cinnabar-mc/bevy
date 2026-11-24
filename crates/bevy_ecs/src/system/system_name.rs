@@ -54,6 +54,7 @@ impl SystemName {
 unsafe impl SystemParam for SystemName {
     type State = ();
     type Item<'w, 's> = SystemName;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 

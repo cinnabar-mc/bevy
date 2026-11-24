@@ -444,6 +444,7 @@ fn derive_system_param_impl(
             {
                 type State = #state_struct_name<#punctuated_generic_idents>;
                 type Item<'w, 's> = #struct_name #ty_generics;
+                const MAY_APPLY_DEFERRED: bool = <#fields_alias::<'static, 'static, #punctuated_generic_idents> as #path::system::SystemParam>::MAY_APPLY_DEFERRED;
 
                 fn init_state(world: &mut #path::world::World) -> Self::State {
                     #state_struct_name {

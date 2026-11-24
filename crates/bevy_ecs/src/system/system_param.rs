@@ -226,6 +226,15 @@ pub unsafe trait SystemParam: Sized {
     /// You could think of [`SystemParam::Item<'w, 's>`] as being an *operation* that changes the lifetimes bound to `Self`.
     type Item<'world, 'state>: SystemParam<State = Self::State>;
 
+    /// Whether [`apply`](SystemParam::apply) can change the world.
+    ///
+    /// Executors skip applying systems whose parameters all report `false`. An implementation may
+    /// set it to `false` only when its `apply` does nothing, or only forwards to parameters that
+    /// report `false`. The default, `true`, is always correct. Unlike
+    /// [`SystemMeta::set_has_deferred`], which places automatic sync points, this is a property of
+    /// the type and cannot change while a system runs.
+    const MAY_APPLY_DEFERRED: bool = true;
+
     /// Creates a new instance of this param's [`State`](SystemParam::State).
     fn init_state(world: &mut World) -> Self::State;
 
@@ -308,6 +317,7 @@ unsafe impl<'w, 's, D: ReadOnlyQueryData + 'static, F: QueryFilter + 'static> Re
 unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Query<'_, '_, D, F> {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Query<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         // SAFETY: `SystemParam::init_access` calls `QueryState::init_access`,
@@ -348,6 +358,7 @@ unsafe impl<'a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static> System
 {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Single<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         Query::init_state(world)
@@ -401,6 +412,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
 {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Populated<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         Query::init_state(world)
@@ -575,6 +587,7 @@ macro_rules! impl_param_set {
         {
             type State = ($($param::State,)*);
             type Item<'w, 's> = ParamSet<'w, 's, ($($param,)*)>;
+            const MAY_APPLY_DEFERRED: bool = false $(|| $param::MAY_APPLY_DEFERRED)*;
 
             #[expect(
                 clippy::allow_attributes,
@@ -677,6 +690,7 @@ unsafe impl<'a, T: Resource> ReadOnlySystemParam for Res<'a, T> {}
 unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = Res<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_component::<T>()
@@ -730,6 +744,7 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
 unsafe impl<'a, T: Resource<Mutability = Mutable>> SystemParam for ResMut<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = ResMut<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_component::<T>()
@@ -786,6 +801,7 @@ unsafe impl<'w> ReadOnlySystemParam for &'w World {}
 unsafe impl SystemParam for &'_ World {
     type State = ();
     type Item<'w, 's> = &'w World;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -822,6 +838,7 @@ unsafe impl SystemParam for &'_ World {
 unsafe impl SystemParam for &'_ mut World {
     type State = ();
     type Item<'world, 'state> = &'world mut World;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -853,6 +870,7 @@ unsafe impl SystemParam for &'_ mut World {
 unsafe impl<'w> SystemParam for DeferredWorld<'w> {
     type State = ();
     type Item<'world, 'state> = DeferredWorld<'world>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1050,6 +1068,7 @@ where
 unsafe impl<'a, T: FromWorld + Send + 'static> SystemParam for Local<'a, T> {
     type State = SyncCell<T>;
     type Item<'w, 's> = Local<'s, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         SyncCell::new(T::from_world(world))
@@ -1285,6 +1304,7 @@ pub struct NonSendMarker(PhantomData<*mut ()>);
 unsafe impl SystemParam for NonSendMarker {
     type State = ();
     type Item<'w, 's> = Self;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     #[inline]
     fn init_state(_world: &mut World) -> Self::State {}
@@ -1320,6 +1340,7 @@ unsafe impl<'w, T> ReadOnlySystemParam for NonSend<'w, T> {}
 unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = NonSend<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_non_send::<T>()
@@ -1366,6 +1387,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
 unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = NonSendMut<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_non_send::<T>()
@@ -1414,6 +1436,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Archetypes {}
 unsafe impl<'a> SystemParam for &'a Archetypes {
     type State = ();
     type Item<'w, 's> = &'w Archetypes;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1444,6 +1467,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a ResourceEntities {}
 unsafe impl<'a> SystemParam for &'a ResourceEntities {
     type State = ();
     type Item<'w, 's> = &'w ResourceEntities;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1474,6 +1498,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Components {}
 unsafe impl<'a> SystemParam for &'a Components {
     type State = ();
     type Item<'w, 's> = &'w Components;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1504,6 +1529,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Entities {}
 unsafe impl<'a> SystemParam for &'a Entities {
     type State = ();
     type Item<'w, 's> = &'w Entities;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1534,6 +1560,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a EntityAllocator {}
 unsafe impl<'a> SystemParam for &'a EntityAllocator {
     type State = ();
     type Item<'w, 's> = &'w EntityAllocator;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1564,6 +1591,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Bundles {}
 unsafe impl<'a> SystemParam for &'a Bundles {
     type State = ();
     type Item<'w, 's> = &'w Bundles;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1623,6 +1651,7 @@ unsafe impl ReadOnlySystemParam for SystemChangeTick {}
 unsafe impl SystemParam for SystemChangeTick {
     type State = ();
     type Item<'w, 's> = SystemChangeTick;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1653,6 +1682,7 @@ unsafe impl<T: SystemParam> SystemParam for Option<T> {
     type State = T::State;
 
     type Item<'world, 'state> = Option<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1695,6 +1725,7 @@ unsafe impl<T: SystemParam> SystemParam for Result<T, SystemParamValidationError
     type State = T::State;
 
     type Item<'world, 'state> = Result<T::Item<'world, 'state>, SystemParamValidationError>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1790,6 +1821,7 @@ unsafe impl<T: SystemParam> SystemParam for If<T> {
     type State = T::State;
 
     type Item<'world, 'state> = If<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1838,6 +1870,7 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
     type State = Vec<T::State>;
 
     type Item<'world, 'state> = Vec<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         Vec::new()
@@ -1890,6 +1923,7 @@ unsafe impl<T: SystemParam> SystemParam for ParamSet<'_, '_, Vec<T>> {
     type State = Vec<T::State>;
 
     type Item<'world, 'state> = ParamSet<'world, 'state, Vec<T>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         Vec::new()
@@ -1993,6 +2027,7 @@ unsafe impl<T: SystemParam, const N: usize> SystemParam for SmallVec<[T; N]> {
     type State = SmallVec<[T::State; N]>;
 
     type Item<'world, 'state> = SmallVec<[T::Item<'world, 'state>; N]>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         SmallVec::new()
@@ -2062,6 +2097,7 @@ macro_rules! impl_system_param_tuple {
         unsafe impl<$($param: SystemParam),*> SystemParam for ($($param,)*) {
             type State = ($($param::State,)*);
             type Item<'w, 's> = ($($param::Item::<'w, 's>,)*);
+            const MAY_APPLY_DEFERRED: bool = false $(|| $param::MAY_APPLY_DEFERRED)*;
 
             #[inline]
             #[track_caller]
@@ -2235,6 +2271,7 @@ unsafe impl<'w, 's, P: ReadOnlySystemParam + 'static> ReadOnlySystemParam
 unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_, P> {
     type State = P::State;
     type Item<'world, 'state> = StaticSystemParam<'world, 'state, P>;
+    const MAY_APPLY_DEFERRED: bool = P::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         P::init_state(world)
@@ -2273,6 +2310,7 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_, 
 unsafe impl<T: ?Sized> SystemParam for PhantomData<T> {
     type State = ();
     type Item<'world, 'state> = Self;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -2337,6 +2375,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> ReadOnlySystemPara
 unsafe impl<P: SystemParam + 'static> SystemParam for &'_ mut SystemState<P> {
     type State = SystemState<P>;
     type Item<'world, 'state> = &'state mut SystemState<P>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         SystemState::new(world)
@@ -2667,6 +2706,7 @@ unsafe impl SystemParam for FilteredResources<'_, '_> {
     type State = Access;
 
     type Item<'world, 'state> = FilteredResources<'world, 'state>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {
         Access::new()
@@ -2712,6 +2752,7 @@ unsafe impl SystemParam for FilteredResourcesMut<'_, '_> {
     type State = Access;
 
     type Item<'world, 'state> = FilteredResourcesMut<'world, 'state>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {
         Access::new()

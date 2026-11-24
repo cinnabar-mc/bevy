@@ -63,6 +63,7 @@ unsafe impl SystemParam for WorldId {
     type State = ();
 
     type Item<'world, 'state> = WorldId;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_: &mut World) -> Self::State {}
 

@@ -36,9 +36,11 @@ pub struct SingleThreadedExecutor {
     completed_systems: FixedBitSet,
     /// Systems that have run but have not had their buffers applied.
     unapplied_systems: FixedBitSet,
-    /// Systems with deferred buffers. Applying any other system does nothing (its parameters'
-    /// `apply` is empty unless one of them marked the system as having deferred buffers), so only
-    /// these are queued for application.
+    /// Systems whose [`System::may_apply_deferred`](crate::system::System::may_apply_deferred) is true. Applying any other system does
+    /// nothing, so only these are queued for application. That answer holds for the system's
+    /// whole lifetime, so it is read once here. It is a type-level property of the parameters
+    /// rather than [`System::has_deferred`](crate::system::System::has_deferred), which a custom parameter could leave unset while
+    /// still applying something.
     deferred_systems: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
@@ -55,7 +57,7 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.deferred_systems = FixedBitSet::with_capacity(sys_count);
         for (index, system) in schedule.systems.iter().enumerate() {
             self.deferred_systems
-                .set(index, system.system.has_deferred());
+                .set(index, system.system.may_apply_deferred());
         }
     }
 
@@ -336,20 +338,22 @@ fn handle_unwind_in_run_condition(
 #[cfg(test)]
 mod tests {
     use crate::{
+        change_detection::Tick,
         prelude::*,
         schedule::{ApplyDeferred, SingleThreadedExecutor},
+        system::{SystemAccess, SystemMeta, SystemParam, SystemParamValidationError},
+        world::unsafe_world_cell::UnsafeWorldCell,
     };
     use alloc::{vec, vec::Vec};
 
     #[derive(Component)]
-    struct Marker(u32);
+    struct Marker;
 
     #[derive(Resource, Default)]
     struct Seen(Vec<usize>);
 
-    fn spawn_one(mut commands: Commands, mut next: Local<u32>) {
-        *next += 1;
-        commands.spawn(Marker(*next));
+    fn spawn_one(mut commands: Commands) {
+        commands.spawn(Marker);
     }
 
     fn count(markers: Query<&Marker>, mut seen: ResMut<Seen>) {
@@ -380,5 +384,135 @@ mod tests {
         assert_eq!(world.query::<&Marker>().iter(&world).count(), 2);
         schedule.run(&mut world);
         assert_eq!(world.resource::<Seen>().0, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+    }
+
+    /// Counts spawn requests and spawns them in `apply`, without ever marking its system as having
+    /// deferred buffers. Its buffer is only created on the system's first run, after the executor
+    /// was built.
+    struct LazySpawner<'s>(&'s mut Option<u32>);
+
+    // SAFETY: The parameter accesses no world data.
+    unsafe impl SystemParam for LazySpawner<'_> {
+        type State = Option<u32>;
+        type Item<'w, 's> = LazySpawner<'s>;
+
+        fn init_state(_world: &mut World) -> Self::State {
+            None
+        }
+
+        fn init_access(
+            _state: &Self::State,
+            _system_meta: &mut SystemMeta,
+            _system_access: &mut SystemAccess,
+            _world: &mut World,
+        ) {
+        }
+
+        fn apply(state: &mut Self::State, _system_meta: &SystemMeta, world: &mut World) {
+            for _ in 0..state.take().unwrap_or(0) {
+                world.spawn(Marker);
+            }
+        }
+
+        unsafe fn get_param<'w, 's>(
+            state: &'s mut Self::State,
+            _system_meta: &SystemMeta,
+            _world: UnsafeWorldCell<'w>,
+            _change_tick: Tick,
+        ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
+            Ok(LazySpawner(state))
+        }
+    }
+
+    fn lazy_spawn(spawner: LazySpawner) {
+        *spawner.0.get_or_insert(0) += 1;
+    }
+
+    #[test]
+    fn a_parameter_that_applies_without_the_deferred_flag_is_applied_at_the_sync_point() {
+        let mut world = World::new();
+        world.init_resource::<Seen>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        schedule.add_systems((count, lazy_spawn, ApplyDeferred, count).chain_ignore_deferred());
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<Seen>().0, vec![0, 1, 1, 2]);
+    }
+
+    #[derive(Resource)]
+    struct Value(usize);
+
+    fn write_one(mut commands: Commands) {
+        commands.insert_resource(Value(1));
+    }
+
+    fn write_two(mut commands: Commands) {
+        commands.insert_resource(Value(2));
+    }
+
+    fn read_value(value: Option<Res<Value>>, mut seen: ResMut<Seen>) {
+        seen.0.push(value.map_or(0, |value| value.0));
+    }
+
+    #[test]
+    fn buffers_meeting_at_one_sync_point_apply_in_schedule_order() {
+        for (first_writes_two, expected) in [(false, 2), (true, 1)] {
+            let mut world = World::new();
+            world.init_resource::<Seen>();
+            let mut schedule = Schedule::default();
+            schedule.set_executor(SingleThreadedExecutor::new());
+            if first_writes_two {
+                schedule.add_systems(
+                    (write_two, count, write_one, ApplyDeferred, read_value)
+                        .chain_ignore_deferred(),
+                );
+            } else {
+                schedule.add_systems(
+                    (write_one, count, write_two, ApplyDeferred, read_value)
+                        .chain_ignore_deferred(),
+                );
+            }
+            schedule.run(&mut world);
+            assert_eq!(world.resource::<Seen>().0, vec![0, expected]);
+        }
+    }
+
+    #[derive(SystemParam)]
+    #[expect(dead_code, reason = "Only the parameter type is inspected.")]
+    struct Observing<'w, 's> {
+        markers: Query<'w, 's, &'static Marker>,
+        seen: Res<'w, Seen>,
+        next: Local<'s, u32>,
+    }
+
+    #[derive(SystemParam)]
+    #[expect(dead_code, reason = "Only the parameter type is inspected.")]
+    struct Spawning<'w, 's> {
+        commands: Commands<'w, 's>,
+        seen: Res<'w, Seen>,
+    }
+
+    const _: () = {
+        assert!(!<Observing as SystemParam>::MAY_APPLY_DEFERRED);
+        assert!(
+            !<(Query<&Marker>, ResMut<Seen>, Option<Res<Seen>>) as SystemParam>::MAY_APPLY_DEFERRED
+        );
+        assert!(<Spawning as SystemParam>::MAY_APPLY_DEFERRED);
+        assert!(<Option<Commands> as SystemParam>::MAY_APPLY_DEFERRED);
+        assert!(<LazySpawner as SystemParam>::MAY_APPLY_DEFERRED);
+    };
+
+    #[test]
+    fn only_systems_whose_parameters_may_apply_report_it() {
+        assert!(!IntoSystem::into_system(count).may_apply_deferred());
+        assert!(IntoSystem::into_system(spawn_one).may_apply_deferred());
+        assert!(IntoSystem::into_system(lazy_spawn).may_apply_deferred());
+        assert!(!IntoSystem::into_system(count.pipe(|| {})).may_apply_deferred());
+        assert!(IntoSystem::into_system(count.pipe(lazy_spawn_after)).may_apply_deferred());
+    }
+
+    fn lazy_spawn_after(spawner: LazySpawner) {
+        lazy_spawn(spawner);
     }
 }
