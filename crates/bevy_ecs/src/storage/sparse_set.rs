@@ -132,21 +132,6 @@ impl<I: SparseSetIndex, V> SparseArray<I, V> {
         self.values.clear();
     }
 
-    /// The number of indexes the array can hold without reallocating.
-    #[inline]
-    pub(crate) fn capacity(&self) -> usize {
-        self.values.capacity()
-    }
-
-    /// The address of the slot for `index`, if `index` is within the array. The address stays
-    /// valid until the array reallocates or is cleared.
-    #[inline]
-    pub(crate) fn slot(&self, index: I) -> Option<core::ptr::NonNull<Option<V>>> {
-        self.values
-            .get(index.sparse_set_index())
-            .map(core::ptr::NonNull::from)
-    }
-
     /// Converts the [`SparseArray`] into an immutable variant.
     pub(crate) fn into_immutable(self) -> ImmutableSparseArray<I, V> {
         ImmutableSparseArray {
@@ -184,12 +169,34 @@ pub struct ComponentSparseSet {
     #[cfg(debug_assertions)]
     entities: Vec<Entity>,
     sparse: SparseArray<EntityIndex, TableRow>,
-    /// Advances whenever stored values move: the dense storage or the sparse array reallocates, a
-    /// removal swaps another value into the freed row, or the set is cleared. Adding a value
-    /// without reallocating or removing the last row moves nothing. A pointer read for an entity
-    /// stays valid while the version is unchanged and that entity's sparse slot still holds the
-    /// row it was read at.
-    structure_version: Arc<AtomicU64>,
+    /// Counters that tell cached pointers into this set whether they are still valid; see
+    /// [`SetVersions`].
+    structure_version: Arc<SetVersions>,
+}
+
+/// Change counters of one [`ComponentSparseSet`], shared with pointer caches.
+///
+/// A pointer read for an entity's value stays valid while `moved` is unchanged and the entity
+/// still has its value at the row it was read at. That holds trivially while `removed` is also
+/// unchanged; otherwise it is confirmed by looking the entity's row up again.
+#[derive(Debug, Default)]
+pub(crate) struct SetVersions {
+    /// Advances whenever stored values move: the dense storage reallocates, a removal swaps the
+    /// last value into the freed row, or the set is cleared. Adding a value without reallocating
+    /// or removing the last row moves nothing.
+    pub(crate) moved: AtomicU64,
+    /// Advances on every removal, so a cache knows when to confirm its entity's row.
+    pub(crate) removed: AtomicU64,
+}
+
+/// Advances `counter`. Callers hold exclusive world access, so a plain load and store cannot race
+/// a reader or another writer, and avoid a locked read-modify-write.
+#[inline]
+fn advance(counter: &AtomicU64) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
 }
 
 impl ComponentSparseSet {
@@ -201,30 +208,21 @@ impl ComponentSparseSet {
             dense: Column::with_capacity(component_info, entities.capacity()),
             entities,
             sparse: Default::default(),
-            structure_version: Arc::new(AtomicU64::new(0)),
+            structure_version: Arc::new(SetVersions::default()),
         }
     }
 
-    /// The counter that advances whenever values stored in this set move.
-    ///
-    /// Pointers returned by [`Self::get_with_ticks`] for an entity keep addressing that entity's
-    /// value and change ticks while the counter holds the value it had when they were read and
-    /// [`Self::sparse_slot`] of the entity still holds the same row.
+    /// The counters that tell whether pointers returned by [`Self::get_with_ticks`] for an entity
+    /// still address that entity's value and change ticks; see [`SetVersions`].
     #[inline]
-    pub(crate) fn structure_version(&self) -> &Arc<AtomicU64> {
+    pub(crate) fn structure_version(&self) -> &Arc<SetVersions> {
         &self.structure_version
     }
 
-    /// The row of `entity`'s value with the address of its sparse slot, which holds `Some(row)`
-    /// while the value stays at that row. The address stays valid while
-    /// [`Self::structure_version`] is unchanged.
+    /// The row holding `entity`'s value, if it has one.
     #[inline]
-    pub(crate) fn sparse_slot(
-        &self,
-        entity: Entity,
-    ) -> Option<(core::ptr::NonNull<Option<TableRow>>, TableRow)> {
-        let row = *self.sparse.get(entity.index())?;
-        Some((self.sparse.slot(entity.index())?, row))
+    pub(crate) fn row(&self, entity: Entity) -> Option<TableRow> {
+        self.sparse.get(entity.index()).copied()
     }
 
     /// Marks every pointer into this set's storage as stale.
@@ -233,11 +231,7 @@ impl ComponentSparseSet {
     /// through the world's resource map while its value is still stored.
     #[inline]
     pub(crate) fn advance_structure_version(&self) {
-        // Every caller holds exclusive world access, so a plain load and store cannot race a
-        // reader or another writer, and avoids a locked read-modify-write on every insert.
-        let version = self.structure_version.load(Ordering::Relaxed);
-        self.structure_version
-            .store(version.wrapping_add(1), Ordering::Relaxed);
+        advance(&self.structure_version.moved);
     }
 
     /// Removes all of the values stored within.
@@ -285,7 +279,6 @@ impl ComponentSparseSet {
         } else {
             let dense_index = self.entities.len();
             let capacity = self.entities.capacity();
-            let sparse_capacity = self.sparse.capacity();
 
             #[cfg(not(debug_assertions))]
             self.entities.push(entity.index());
@@ -313,9 +306,6 @@ impl ComponentSparseSet {
             let table_row = unsafe { TableRow::new(NonMaxU32::new_unchecked(dense_index as u32)) };
             self.dense.initialize(table_row, value, change_tick, caller);
             self.sparse.insert(entity.index(), table_row);
-            if sparse_capacity != self.sparse.capacity() {
-                self.advance_structure_version();
-            }
 
             core::mem::forget(_guard);
         }
@@ -438,6 +428,7 @@ impl ComponentSparseSet {
     #[must_use = "The returned pointer must be used to drop the removed component."]
     pub(crate) fn remove_and_forget(&mut self, entity: Entity) -> Option<OwningPtr<'_>> {
         self.sparse.remove(entity.index()).map(|dense_index| {
+            advance(&self.structure_version.removed);
             #[cfg(debug_assertions)]
             assert_eq!(entity, self.entities[dense_index.index()]);
             let last = self.entities.len() - 1;
@@ -492,6 +483,7 @@ impl ComponentSparseSet {
         self.sparse
             .remove(entity.index())
             .map(|dense_index| {
+                advance(&self.structure_version.removed);
                 #[cfg(debug_assertions)]
                 assert_eq!(entity, self.entities[dense_index.index()]);
                 let last = self.entities.len() - 1;
@@ -951,6 +943,7 @@ mod tests {
                 .get(id)
                 .unwrap()
                 .structure_version()
+                .moved
                 .load(Ordering::Relaxed)
         };
         let mut last = version(&world);
@@ -978,10 +971,7 @@ mod tests {
         world.entity_mut(second).remove::<Sparse>();
         assert!(!advanced(&world), "removing the last row moves nothing");
         world.entity_mut(second).insert(Sparse);
-        assert!(
-            !advanced(&world),
-            "adding within capacity and the sparse array moves nothing"
-        );
+        assert!(!advanced(&world), "adding within capacity moves nothing");
         world.entity_mut(first).remove::<Sparse>();
         assert!(
             advanced(&world),

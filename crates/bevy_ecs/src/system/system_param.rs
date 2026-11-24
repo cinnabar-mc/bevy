@@ -2895,6 +2895,7 @@ mod tests {
                 .get(id)
                 .unwrap()
                 .structure_version()
+                .moved
                 .load(core::sync::atomic::Ordering::Relaxed)
         };
         let before = version(&world);
