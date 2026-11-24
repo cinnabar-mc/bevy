@@ -717,16 +717,19 @@ type CameraComponents = (
 );
 
 /// Writes this frame's [`CameraComponents`] when the command applies. A render camera that
-/// already has all of them gets them assigned in place: the same values, marked changed at the
-/// same tick, without the bundle insert's lookups or its replace and insert hooks and observers,
-/// none of which are registered for these components. Otherwise they are inserted.
+/// already has all of them, and the [`RenderVisibleEntities`] that [`ExtractedCamera`] requires,
+/// gets them assigned in place: the same values, marked changed at the same tick, without the
+/// bundle insert's lookups or its replace and insert hooks and observers. None are registered for
+/// these components; an `Insert` observer added for one would only see the first extraction.
+/// Otherwise they are inserted, which also restores any missing required component.
 fn write_camera_components(components: CameraComponents) -> impl EntityCommand<Out = ()> {
     move |mut entity: EntityWorldMut| {
         if !(entity.contains::<ExtractedCamera>()
             && entity.contains::<ResolvedCompositingSpace>()
             && entity.contains::<ExtractedView>()
             && entity.contains::<RenderExtractedVisibleEntities>()
-            && entity.contains::<Frustum>())
+            && entity.contains::<Frustum>()
+            && entity.contains::<RenderVisibleEntities>())
         {
             entity.insert(components);
             return;
@@ -1315,6 +1318,24 @@ mod tests {
             ticks(reinserted).0,
             "a first write adds the components"
         );
+    }
+
+    #[test]
+    fn a_removed_required_component_is_restored_by_the_next_write() {
+        use bevy_ecs::world::CommandQueue;
+
+        let mut world = World::new();
+        let camera = world.spawn(camera_components(1)).id();
+        world.entity_mut(camera).remove::<RenderVisibleEntities>();
+
+        let mut queue = CommandQueue::default();
+        Commands::new(&mut queue, &world)
+            .entity(camera)
+            .queue(write_camera_components(camera_components(2)));
+        queue.apply(&mut world);
+
+        assert!(world.entity(camera).contains::<RenderVisibleEntities>());
+        assert_eq!(world.get::<ExtractedCamera>(camera).unwrap().order, 2);
     }
 
     #[test]
