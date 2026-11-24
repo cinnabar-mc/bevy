@@ -21,8 +21,8 @@ use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget}
 use bevy_color::{ColorToPacked, LinearRgba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    entity::EntityHashMap, entity_disabling::Disabled, message::message_update_system, prelude::*,
-    query::Allow, system::SystemState,
+    archetype::Archetypes, component::ComponentIdFor, entity::EntityHashMap,
+    message::message_update_system, prelude::*, system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
 use bevy_log::{error, info, warn};
@@ -257,13 +257,24 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
 /// [`trigger_screenshots`], in `Update`, so no captured entity can appear between this system and
 /// the `ApplyDeferred` it runs before; with none present, the despawn command (which builds a query
 /// each time) is not queued. An app that queues `Captured` itself in `First`, ahead of that flush,
-/// has those entities despawned a frame later. Disabled captured entities count too, so a queued
-/// re-enable still finds the command queued.
+/// has those entities despawned a frame later. Captured entities hidden by any disabling component
+/// count too, so a queued re-enable still finds the command queued.
 fn clear_screenshots(
     mut commands: Commands,
-    captured: Query<(), (With<Captured>, Allow<Disabled>)>,
+    archetypes: &Archetypes,
+    captured: ComponentIdFor<Captured>,
 ) {
-    if !captured.is_empty() {
+    // The component index lists every archetype holding `Captured`, whatever default query
+    // filters would hide.
+    let any_captured = archetypes
+        .component_index()
+        .get(&captured.get())
+        .is_some_and(|holding| {
+            holding
+                .keys()
+                .any(|&archetype| !archetypes[archetype].is_empty())
+        });
+    if any_captured {
         commands.despawn_all::<With<Captured>>();
     }
 }
@@ -919,7 +930,7 @@ mod recovery_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy_ecs::schedule::Schedule;
+    use bevy_ecs::{entity_disabling::Disabled, schedule::Schedule};
 
     #[test]
     fn clearing_despawns_only_captured_screenshots() {
@@ -949,5 +960,28 @@ mod tests {
         );
         reenable.run(&mut world);
         assert!(world.get_entity(disabled).is_err());
+    }
+
+    /// A disabling component an app registers, beyond Bevy's own.
+    #[derive(Component)]
+    struct Hibernating;
+
+    #[test]
+    fn a_capture_hidden_by_an_app_disabling_component_is_despawned_once_reenabled() {
+        let mut world = World::new();
+        world.register_disabling_component::<Hibernating>();
+        let hidden = world.spawn((Captured, Hibernating)).id();
+        let mut reenable = Schedule::default();
+        reenable.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(hidden).remove::<Hibernating>();
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        reenable.run(&mut world);
+        assert!(world.get_entity(hidden).is_err());
     }
 }
