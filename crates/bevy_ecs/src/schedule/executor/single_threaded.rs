@@ -36,6 +36,10 @@ pub struct SingleThreadedExecutor {
     completed_systems: FixedBitSet,
     /// Systems that have run but have not had their buffers applied.
     unapplied_systems: FixedBitSet,
+    /// Systems with deferred buffers. Applying any other system does nothing (its parameters'
+    /// `apply` is empty unless one of them marked the system as having deferred buffers), so only
+    /// these are queued for application.
+    deferred_systems: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
 }
@@ -48,6 +52,11 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.evaluated_sets = FixedBitSet::with_capacity(set_count);
         self.completed_systems = FixedBitSet::with_capacity(sys_count);
         self.unapplied_systems = FixedBitSet::with_capacity(sys_count);
+        self.deferred_systems = FixedBitSet::with_capacity(sys_count);
+        for (index, system) in schedule.systems.iter().enumerate() {
+            self.deferred_systems
+                .set(index, system.system.has_deferred());
+        }
     }
 
     fn run(
@@ -159,7 +168,9 @@ impl SystemExecutor for SingleThreadedExecutor {
                 (f)(system);
             }
 
-            self.unapplied_systems.insert(system_index);
+            if self.deferred_systems.contains(system_index) {
+                self.unapplied_systems.insert(system_index);
+            }
         }
 
         if self.apply_final_deferred {
@@ -183,6 +194,7 @@ impl SingleThreadedExecutor {
             evaluated_sets: FixedBitSet::new(),
             completed_systems: FixedBitSet::new(),
             unapplied_systems: FixedBitSet::new(),
+            deferred_systems: FixedBitSet::new(),
             apply_final_deferred: true,
         }
     }
@@ -318,5 +330,55 @@ fn handle_unwind_in_run_condition(
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        prelude::*,
+        schedule::{ApplyDeferred, SingleThreadedExecutor},
+    };
+    use alloc::{vec, vec::Vec};
+
+    #[derive(Component)]
+    struct Marker(u32);
+
+    #[derive(Resource, Default)]
+    struct Seen(Vec<usize>);
+
+    fn spawn_one(mut commands: Commands, mut next: Local<u32>) {
+        *next += 1;
+        commands.spawn(Marker(*next));
+    }
+
+    fn count(markers: Query<&Marker>, mut seen: ResMut<Seen>) {
+        seen.0.push(markers.iter().count());
+    }
+
+    #[test]
+    fn deferred_buffers_apply_at_sync_points_and_at_the_end_among_systems_without_them() {
+        let mut world = World::new();
+        world.init_resource::<Seen>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        schedule.add_systems(
+            (
+                count,
+                spawn_one,
+                count,
+                ApplyDeferred,
+                count,
+                spawn_one,
+                count,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut world);
+        // The second spawn is applied only by the schedule's final application.
+        assert_eq!(world.resource::<Seen>().0, vec![0, 0, 1, 1]);
+        assert_eq!(world.query::<&Marker>().iter(&world).count(), 2);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<Seen>().0, vec![0, 0, 1, 1, 2, 2, 3, 3]);
     }
 }
