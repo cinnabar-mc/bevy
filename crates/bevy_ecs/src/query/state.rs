@@ -566,6 +566,11 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         self.validate_world(world.id());
         D::update_archetypes(&mut self.fetch_state, world);
         F::update_archetypes(&mut self.filter_state, world);
+        // Nothing to match while no archetype was added. Checking that first skips the scan of
+        // the required-component set, which a query refreshes on every system run.
+        if self.archetype_generation == world.archetypes().generation() {
+            return;
+        }
         if self.component_access.required.is_clear() {
             let archetypes = world.archetypes();
             let old_generation =
@@ -579,10 +584,6 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                 }
             }
         } else {
-            // skip if we are already up to date
-            if self.archetype_generation == world.archetypes().generation() {
-                return;
-            }
             // if there are required components, we can optimize by only iterating through archetypes
             // that contain at least one of the required components
             let potential_archetypes = self
@@ -2113,6 +2114,38 @@ mod tests {
         system::{QueryLens, RunSystemOnce},
         world::{EntityRef, FilteredEntityMut, FilteredEntityRef},
     };
+
+    #[test]
+    fn archetypes_added_between_updates_are_matched_with_and_without_required_components() {
+        #[derive(Component)]
+        struct A;
+        #[derive(Component)]
+        struct B;
+
+        let mut world = World::new();
+        world.spawn(A);
+        // `Entity` requires no component; `&A` does.
+        let mut every = world.query::<Entity>();
+        let mut with_a = world.query::<&A>();
+        let entities_before = every.iter(&world).count();
+        assert_eq!(with_a.iter(&world).count(), 1);
+        let (every_before, with_a_before) = (
+            every.matched_archetypes().count(),
+            with_a.matched_archetypes().count(),
+        );
+        // No new archetype: updating again changes nothing.
+        every.update_archetypes(&world);
+        with_a.update_archetypes(&world);
+        assert_eq!(every.matched_archetypes().count(), every_before);
+        assert_eq!(with_a.matched_archetypes().count(), with_a_before);
+
+        world.spawn((A, B));
+        world.spawn(B);
+        assert_eq!(every.iter(&world).count(), entities_before + 2);
+        assert_eq!(with_a.iter(&world).count(), 2);
+        assert_eq!(every.matched_archetypes().count(), every_before + 2);
+        assert_eq!(with_a.matched_archetypes().count(), with_a_before + 1);
+    }
 
     #[test]
     #[should_panic]
