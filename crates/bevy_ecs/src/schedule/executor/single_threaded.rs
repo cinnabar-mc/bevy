@@ -36,11 +36,14 @@ pub struct SingleThreadedExecutor {
     completed_systems: FixedBitSet,
     /// Systems that have run but have not had their buffers applied.
     unapplied_systems: FixedBitSet,
-    /// Systems whose [`System::may_apply_deferred`](crate::system::System::may_apply_deferred) is true. Applying any other system does
-    /// nothing, so only these are queued for application. That answer holds for the system's
-    /// whole lifetime, so it is read once here. It is a type-level property of the parameters
-    /// rather than [`System::has_deferred`](crate::system::System::has_deferred), which a custom parameter could leave unset while
-    /// still applying something.
+    /// Systems whose [`System::may_apply_deferred`] is true. Applying any other system does
+    /// nothing, so only these are queued for application. The answer holds for the system's whole
+    /// lifetime, so it is read once here. It is a property of the parameter types rather than
+    /// [`System::has_deferred`], which a custom parameter could leave unset while still applying
+    /// something.
+    ///
+    /// [`System::may_apply_deferred`]: crate::system::System::may_apply_deferred
+    /// [`System::has_deferred`]: crate::system::System::has_deferred
     deferred_systems: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
