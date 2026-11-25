@@ -49,6 +49,9 @@ pub struct SingleThreadedExecutor {
     /// type never changes, so this is recorded once instead of asking each system for its type on
     /// every run.
     sync_points: FixedBitSet,
+    /// Systems in at least one set with conditions. The others skip the walk over their sets,
+    /// which would scan a bitset sized to every set in the schedule and find nothing.
+    in_conditioned_sets: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
 }
@@ -63,6 +66,10 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.unapplied_systems = FixedBitSet::with_capacity(sys_count);
         self.deferred_systems = FixedBitSet::with_capacity(sys_count);
         self.sync_points = FixedBitSet::with_capacity(sys_count);
+        self.in_conditioned_sets = FixedBitSet::with_capacity(sys_count);
+        for (index, sets) in schedule.sets_with_conditions_of_systems.iter().enumerate() {
+            self.in_conditioned_sets.set(index, !sets.is_clear());
+        }
         for (index, system) in schedule.systems.iter().enumerate() {
             self.deferred_systems
                 .set(index, system.system.may_apply_deferred());
@@ -101,7 +108,11 @@ impl SystemExecutor for SingleThreadedExecutor {
             let should_run_span = info_span!("check_conditions", name = name.to_string()).entered();
 
             let mut should_run = !self.completed_systems.contains(system_index);
-            for set_idx in schedule.sets_with_conditions_of_systems[system_index].ones() {
+            let conditioned_sets = self
+                .in_conditioned_sets
+                .contains(system_index)
+                .then(|| &schedule.sets_with_conditions_of_systems[system_index]);
+            for set_idx in conditioned_sets.into_iter().flat_map(FixedBitSet::ones) {
                 if self.evaluated_sets.contains(set_idx) {
                     continue;
                 }
@@ -208,6 +219,7 @@ impl SingleThreadedExecutor {
             unapplied_systems: FixedBitSet::new(),
             deferred_systems: FixedBitSet::new(),
             sync_points: FixedBitSet::new(),
+            in_conditioned_sets: FixedBitSet::new(),
             apply_final_deferred: true,
         }
     }
@@ -395,6 +407,37 @@ mod tests {
         assert_eq!(world.query::<&Marker>().iter(&world).count(), 2);
         schedule.run(&mut world);
         assert_eq!(world.resource::<Seen>().0, vec![0, 0, 1, 1, 2, 2, 3, 3]);
+    }
+
+    #[derive(crate::schedule::SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+    enum Gated {
+        Open,
+        Closed,
+    }
+
+    fn push(n: usize) -> impl FnMut(ResMut<Seen>) {
+        move |mut seen: ResMut<Seen>| seen.0.push(n)
+    }
+
+    #[test]
+    fn set_conditions_gate_only_the_systems_in_their_sets() {
+        let mut world = World::new();
+        world.init_resource::<Seen>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        schedule.configure_sets((Gated::Open.run_if(|| true), Gated::Closed.run_if(|| false)));
+        schedule.add_systems(
+            (
+                push(1),
+                push(2).in_set(Gated::Closed),
+                push(3).in_set(Gated::Open),
+                push(4),
+                push(5).in_set(Gated::Open).in_set(Gated::Closed),
+            )
+                .chain(),
+        );
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<Seen>().0, vec![1, 3, 4]);
     }
 
     /// Counts spawn requests and spawns them in `apply`, without ever marking its system as having
