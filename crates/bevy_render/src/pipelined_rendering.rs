@@ -1,7 +1,13 @@
 use core::panic::AssertUnwindSafe;
 use std::panic::{catch_unwind, resume_unwind};
 
-use async_channel::{Receiver, Sender};
+use alloc::sync::Arc;
+use async_channel::{Receiver, Sender, TryRecvError};
+use bevy_platform::time::Instant;
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use bevy_app::{App, AppExit, Plugin, SubApp};
 use bevy_derive::AppLabel;
@@ -29,6 +35,83 @@ pub struct RenderAppChannels {
     render_app_in_render_thread: bool,
     /// Pumped during shutdown so the render app's main-thread tasks can finish.
     main_thread_executor: MainThreadExecutor,
+    /// Shared with the render thread: when its current update started and how long updates take.
+    progress: Arc<RenderProgress>,
+    /// How long the main thread may poll for a render app that is about to come back.
+    spin_budget: Duration,
+}
+
+/// The render thread's progress, which the main thread reads to predict when the render app
+/// comes back.
+#[derive(Debug)]
+struct RenderProgress {
+    base: Instant,
+    /// Nanoseconds after `base` at which the current render update started; 0 while the render
+    /// thread holds no render app.
+    started: AtomicU64,
+    /// Running average of the time from the start of an update to the render app being sent back,
+    /// in nanoseconds; 0 until the first update.
+    average: AtomicU64,
+}
+
+impl RenderProgress {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            started: AtomicU64::new(0),
+            average: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        // Never 0, which marks "no update running".
+        (self.base.elapsed().as_nanos() as u64).max(1)
+    }
+
+    /// The render thread starts an update.
+    fn begin(&self) {
+        self.started.store(self.now(), Ordering::Relaxed);
+    }
+
+    /// The render thread has sent the render app back.
+    fn end(&self) {
+        let started = self.started.swap(0, Ordering::Relaxed);
+        if started == 0 {
+            return;
+        }
+        let took = self.now().saturating_sub(started);
+        let average = self.average.load(Ordering::Relaxed);
+        let average = if average == 0 {
+            took
+        } else {
+            average - average / 8 + took / 8
+        };
+        self.average.store(average, Ordering::Relaxed);
+    }
+
+    /// How long until the running update is expected to send the render app back, if one is
+    /// running and the render thread has finished one before.
+    fn due_in(&self) -> Option<Duration> {
+        let started = self.started.load(Ordering::Relaxed);
+        let average = self.average.load(Ordering::Relaxed);
+        if started == 0 || average == 0 {
+            return None;
+        }
+        Some(Duration::from_nanos(
+            (started + average).saturating_sub(self.now()),
+        ))
+    }
+}
+
+/// How long the main thread polls for a render app that is due back: enough to cover the usual
+/// spread of a render update's end, and zero where polling would take a hardware thread the render
+/// thread or the task pools need.
+fn main_spin_budget(hardware_threads: usize) -> Duration {
+    if hardware_threads >= 4 {
+        Duration::from_micros(20)
+    } else {
+        Duration::ZERO
+    }
 }
 
 impl RenderAppChannels {
@@ -46,6 +129,10 @@ impl RenderAppChannels {
             render_to_app_receiver,
             render_app_in_render_thread: false,
             main_thread_executor,
+            progress: Arc::new(RenderProgress::new()),
+            spin_budget: main_spin_budget(
+                std::thread::available_parallelism().map_or(1, core::num::NonZero::get),
+            ),
         }
     }
 
@@ -53,6 +140,33 @@ impl RenderAppChannels {
     pub fn send_blocking(&mut self, render_app: SubApp) {
         self.app_to_render_sender.send_blocking(render_app).unwrap();
         self.render_app_in_render_thread = true;
+    }
+
+    /// Polls for the render app when the render thread is predicted to send it back within the
+    /// spin budget, so the main thread does not have to block and be woken for it. Returns `None`
+    /// when it is not due that soon, does not arrive within the budget, or the render thread is
+    /// gone; the caller then blocks on [`Self::recv`].
+    fn try_recv_soon(&mut self) -> Option<SubApp> {
+        let due = self.progress.due_in()?;
+        if self.spin_budget.is_zero() || due > self.spin_budget {
+            return None;
+        }
+        let deadline = Instant::now() + self.spin_budget;
+        loop {
+            match self.render_to_app_receiver.try_recv() {
+                Ok(render_app) => {
+                    self.render_app_in_render_thread = false;
+                    return Some(render_app);
+                }
+                Err(TryRecvError::Closed) => return None,
+                Err(TryRecvError::Empty) if Instant::now() >= deadline => return None,
+                Err(TryRecvError::Empty) => {
+                    for _ in 0..64 {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
     }
 
     /// Receive the `render_app` from the rendering thread.
@@ -182,11 +296,10 @@ impl Plugin for PipelinedRenderingPlugin {
 
         render_to_app_sender.send_blocking(render_app).unwrap();
 
-        app.insert_resource(RenderAppChannels::new(
-            app_to_render_sender,
-            render_to_app_receiver,
-            executor,
-        ));
+        let channels =
+            RenderAppChannels::new(app_to_render_sender, render_to_app_receiver, executor);
+        let progress = channels.progress.clone();
+        app.insert_resource(channels);
 
         std::thread::Builder::new()
             .name("Render thread".into())
@@ -216,12 +329,14 @@ impl Plugin for PipelinedRenderingPlugin {
                         #[cfg(feature = "trace")]
                         let _sub_app_span =
                             bevy_log::info_span!("sub app", name = ?RenderApp).entered();
+                        progress.begin();
                         render_app.update();
                     }
 
                     if render_to_app_sender.send_blocking(render_app).is_err() {
                         break;
                     }
+                    progress.end();
                 }
 
                 bevy_log::debug!("exiting pipelined rendering thread");
@@ -239,17 +354,20 @@ fn renderer_extract(app_world: &mut World, _world: &mut World) {
             // while we wait for the render world to be received.
             // A render app that is already back needs no main thread tasks, so skip the scope
             // and its task pool wake-ups.
-            let render_app = render_channels.try_recv().or_else(|| {
-                ComputeTaskPool::get()
-                    .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
-                        // Poll the receive on this thread: the scope ticks it while running
-                        // main-thread tasks, and the render thread's send wakes this thread.
-                        // Spawning it onto the pool would wake a worker every frame.
-                        s.spawn_on_scope(async { render_channels.recv().await });
-                    })
-                    .pop()
-                    .unwrap()
-            });
+            let render_app = render_channels
+                .try_recv()
+                .or_else(|| render_channels.try_recv_soon())
+                .or_else(|| {
+                    ComputeTaskPool::get()
+                        .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
+                            // Poll the receive on this thread: the scope ticks it while running
+                            // main-thread tasks, and the render thread's send wakes this thread.
+                            // Spawning it onto the pool would wake a worker every frame.
+                            s.spawn_on_scope(async { render_channels.recv().await });
+                        })
+                        .pop()
+                        .unwrap()
+                });
             if let Some(mut render_app) = render_app {
                 render_app.extract(world);
 
@@ -353,6 +471,92 @@ mod tests {
             // The render app is back, so dropping the channels must not wait for it again.
             drop(channels);
         });
+    }
+
+    #[test]
+    fn render_progress_predicts_only_after_a_full_update_and_while_one_runs() {
+        // A clock started a second ago, so timestamps in the past stay above zero.
+        let progress = RenderProgress {
+            base: Instant::now() - Duration::from_secs(1),
+            ..RenderProgress::new()
+        };
+        assert_eq!(progress.due_in(), None, "no update yet");
+        progress.begin();
+        assert_eq!(
+            progress.due_in(),
+            None,
+            "no finished update to predict from"
+        );
+        progress.end();
+        assert_eq!(progress.due_in(), None, "no update running");
+        progress.begin();
+        assert!(progress.due_in().is_some());
+        progress.end();
+        // The average follows the updates' lengths.
+        progress.average.store(8_000, Ordering::Relaxed);
+        progress
+            .started
+            .store(progress.now() - 16_000, Ordering::Relaxed);
+        progress.end();
+        assert!(progress.average.load(Ordering::Relaxed) >= 9_000);
+    }
+
+    #[test]
+    fn the_main_thread_polls_only_with_hardware_threads_to_spare() {
+        assert_eq!(main_spin_budget(2), Duration::ZERO);
+        assert!(main_spin_budget(4) > Duration::ZERO);
+    }
+
+    fn channels_with_progress(
+        started_ago: u64,
+        average: u64,
+        budget: Duration,
+    ) -> (RenderAppChannels, Sender<SubApp>) {
+        let (app_to_render_sender, _app_to_render_receiver) = async_channel::bounded::<SubApp>(1);
+        let (render_to_app_sender, render_to_app_receiver) = async_channel::bounded::<SubApp>(1);
+        let mut channels = RenderAppChannels::new(
+            app_to_render_sender,
+            render_to_app_receiver,
+            MainThreadExecutor::new(),
+        );
+        channels.spin_budget = budget;
+        let now = channels.progress.now();
+        channels
+            .progress
+            .started
+            .store(now.saturating_sub(started_ago).max(1), Ordering::Relaxed);
+        channels.progress.average.store(average, Ordering::Relaxed);
+        (channels, render_to_app_sender)
+    }
+
+    #[test]
+    fn a_render_app_due_back_is_taken_when_it_arrives_during_the_poll() {
+        // Due now, with a budget long enough that scheduling cannot make the test flaky.
+        let (mut channels, sender) = channels_with_progress(1_000, 1_000, TIMEOUT);
+        channels.render_app_in_render_thread = true;
+        let render_thread = thread::spawn(move || {
+            sender.send_blocking(SubApp::new()).unwrap();
+            sender
+        });
+        assert!(channels.try_recv_soon().is_some());
+        assert!(!channels.render_app_in_render_thread);
+        drop(render_thread.join().unwrap());
+    }
+
+    #[test]
+    fn a_render_app_not_due_soon_is_left_to_the_blocking_receive() {
+        // Due in a second, well beyond the budget: no polling at all.
+        let (mut channels, sender) =
+            channels_with_progress(0, 1_000_000_000, Duration::from_micros(20));
+        let start = Instant::now();
+        assert!(channels.try_recv_soon().is_none());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        // Without a budget it never polls either, even for an app that is already back.
+        let (mut channels, sender2) = channels_with_progress(1_000, 1_000, Duration::ZERO);
+        sender2.send_blocking(SubApp::new()).unwrap();
+        assert!(channels.try_recv_soon().is_none());
+        assert!(channels.try_recv().is_some());
+        drop(sender);
     }
 
     #[test]
