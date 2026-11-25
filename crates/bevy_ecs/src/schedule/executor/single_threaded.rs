@@ -45,6 +45,10 @@ pub struct SingleThreadedExecutor {
     /// [`System::may_apply_deferred`]: crate::system::System::may_apply_deferred
     /// [`System::has_deferred`]: crate::system::System::has_deferred
     deferred_systems: FixedBitSet,
+    /// Systems that are [`ApplyDeferred`](crate::schedule::ApplyDeferred) sync points. A system's
+    /// type never changes, so this is recorded once instead of asking each system for its type on
+    /// every run.
+    sync_points: FixedBitSet,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
 }
@@ -58,9 +62,12 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.completed_systems = FixedBitSet::with_capacity(sys_count);
         self.unapplied_systems = FixedBitSet::with_capacity(sys_count);
         self.deferred_systems = FixedBitSet::with_capacity(sys_count);
+        self.sync_points = FixedBitSet::with_capacity(sys_count);
         for (index, system) in schedule.systems.iter().enumerate() {
             self.deferred_systems
                 .set(index, system.system.may_apply_deferred());
+            self.sync_points
+                .set(index, is_apply_deferred(&*system.system));
         }
     }
 
@@ -143,7 +150,7 @@ impl SystemExecutor for SingleThreadedExecutor {
                 continue;
             }
 
-            if is_apply_deferred(&**system) {
+            if self.sync_points.contains(system_index) {
                 self.apply_deferred(schedule, world, error_handler);
                 continue;
             }
@@ -200,6 +207,7 @@ impl SingleThreadedExecutor {
             completed_systems: FixedBitSet::new(),
             unapplied_systems: FixedBitSet::new(),
             deferred_systems: FixedBitSet::new(),
+            sync_points: FixedBitSet::new(),
             apply_final_deferred: true,
         }
     }
