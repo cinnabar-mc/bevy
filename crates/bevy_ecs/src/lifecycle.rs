@@ -696,6 +696,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a RemovedComponentMessages {}
 unsafe impl<'a> SystemParam for &'a RemovedComponentMessages {
     type State = ();
     type Item<'w, 's> = &'w RemovedComponentMessages;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 

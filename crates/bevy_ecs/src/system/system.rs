@@ -131,6 +131,17 @@ pub trait System: Send + Sync + 'static {
     /// This is where [`Commands`](crate::system::Commands) get applied.
     fn apply_deferred(&mut self, world: &mut World);
 
+    /// Whether [`apply_deferred`](System::apply_deferred) can ever change the world, for as long as
+    /// this system exists. Executors may read it once when they are built and skip applying
+    /// systems that return `false`. The default, `true`, is always correct; wrappers return their
+    /// inner systems' answers, and function systems return
+    /// [`SystemParam::MAY_APPLY_DEFERRED`](crate::system::SystemParam::MAY_APPLY_DEFERRED) for
+    /// their parameters.
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        true
+    }
+
     /// Enqueues any [`Deferred`](crate::system::Deferred) system parameters (or other system buffers)
     /// of this system into the world's command buffer.
     fn queue_deferred(&mut self, world: DeferredWorld);

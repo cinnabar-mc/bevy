@@ -202,6 +202,11 @@ impl System for ApplyDeferred {
 
     fn apply_deferred(&mut self, _world: &mut World) {}
 
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        false
+    }
+
     fn queue_deferred(&mut self, _world: DeferredWorld) {}
 
     fn initialize(&mut self, _world: &mut World) -> SystemAccess {
