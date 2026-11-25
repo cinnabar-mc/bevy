@@ -198,12 +198,13 @@ impl Plugin for PipelinedRenderingPlugin {
                 loop {
                     // Take a render app that is already waiting without a scope. Otherwise run a
                     // scope here to allow main world to use this thread while it's waiting for
-                    // the render app.
+                    // the render app. The receive runs on this thread's scope executor, so
+                    // waiting does not wake a pool worker just to poll the channel.
                     let sent_app = match app_to_render_receiver.try_recv() {
                         Ok(render_app) => Some(Ok(render_app)),
                         Err(_) => compute_task_pool
                             .scope(|s| {
-                                s.spawn(async { app_to_render_receiver.recv().await });
+                                s.spawn_on_scope(async { app_to_render_receiver.recv().await });
                             })
                             .pop(),
                     };
@@ -241,7 +242,10 @@ fn renderer_extract(app_world: &mut World, _world: &mut World) {
             let render_app = render_channels.try_recv().or_else(|| {
                 ComputeTaskPool::get()
                     .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
-                        s.spawn(async { render_channels.recv().await });
+                        // Poll the receive on this thread: the scope ticks it while running
+                        // main-thread tasks, and the render thread's send wakes this thread.
+                        // Spawning it onto the pool would wake a worker every frame.
+                        s.spawn_on_scope(async { render_channels.recv().await });
                     })
                     .pop()
                     .unwrap()
@@ -348,6 +352,53 @@ mod tests {
             assert!(channels.try_recv().is_some());
             // The render app is back, so dropping the channels must not wait for it again.
             drop(channels);
+        });
+    }
+
+    #[test]
+    fn renderer_extract_waits_for_the_render_app_while_running_main_thread_tasks() {
+        #[derive(Resource)]
+        struct Extracted;
+
+        run_on_main_thread(|| {
+            let main_thread_id = thread::current().id();
+            let (app_to_render_sender, app_to_render_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let (render_to_app_sender, render_to_app_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let executor = MainThreadExecutor::new();
+            let render_executor = executor.clone();
+            let mut main_world = World::new();
+            main_world.insert_resource(executor.clone());
+            let mut channels =
+                RenderAppChannels::new(app_to_render_sender, render_to_app_receiver, executor);
+            let mut render_app = SubApp::new();
+            render_app.set_extract(|_, render_world| render_world.insert_resource(Extracted));
+            channels.send_blocking(render_app);
+            main_world.insert_resource(channels);
+
+            // The render thread keeps the app until a main-thread task has run, then takes the
+            // extracted app back.
+            let render_thread = thread::spawn(move || {
+                let render_app = app_to_render_receiver.recv_blocking().unwrap();
+                block_on(render_executor.0.spawn(async move {
+                    assert_eq!(thread::current().id(), main_thread_id);
+                }));
+                render_to_app_sender.send_blocking(render_app).unwrap();
+                let render_app = app_to_render_receiver.recv_blocking().unwrap();
+                (
+                    render_app.world().contains_resource::<Extracted>(),
+                    render_to_app_sender,
+                    render_app,
+                )
+            });
+
+            renderer_extract(&mut main_world, &mut World::new());
+
+            let (extracted, render_to_app_sender, render_app) = render_thread.join().unwrap();
+            assert!(extracted);
+            // Return the app so the channels' drop does not wait for it.
+            render_to_app_sender.send_blocking(render_app).unwrap();
         });
     }
 
