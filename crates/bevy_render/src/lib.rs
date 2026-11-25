@@ -58,6 +58,10 @@ pub mod extract_resource {
         bevy_extract::extract_resource::ExtractResourcePlugin<R, crate::RenderApp, F>;
 
     pub use bevy_extract::extract_resource::{extract_resource, ExtractResource};
+    /// The set holding the system that extracts every resource registered with
+    /// [`ExtractResourcePlugin`] for the render app.
+    pub type ExtractResourceSystems =
+        bevy_extract::extract_resource::ExtractResourceSystems<crate::RenderApp>;
 }
 pub mod globals;
 pub mod gpu_component_array_buffer;

@@ -3,7 +3,9 @@ use core::mem;
 use crate::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     extract_component::{ExtractComponent, ExtractComponentPlugin},
-    extract_resource::{extract_resource, ExtractResource, ExtractResourcePlugin},
+    extract_resource::{
+        extract_resource, ExtractResource, ExtractResourcePlugin, ExtractResourceSystems,
+    },
     render_asset::RenderAssets,
     render_resource::TextureView,
     sync_component::SyncComponent,
@@ -104,7 +106,8 @@ impl Plugin for CameraPlugin {
                     ExtractSchedule,
                     (
                         extract_cameras
-                            .after(extract_resource::<ManualTextureViews, RenderApp, ()>),
+                            .after(extract_resource::<ManualTextureViews, RenderApp, ()>)
+                            .after(ExtractResourceSystems::default()),
                         clear_dirty_specializations.in_set(DirtySpecializationSystems::Clear),
                         clear_dirty_wireframe_specializations
                             .in_set(DirtySpecializationSystems::Clear),
