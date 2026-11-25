@@ -293,6 +293,9 @@ impl Plugin for PipelinedRenderingPlugin {
         // clone main thread executor to render world
         let executor = app.world().resource::<MainThreadExecutor>().clone();
         render_app.world_mut().insert_resource(executor.clone());
+        render_app
+            .world_mut()
+            .insert_resource(crate::renderer::FrameTailOnRenderThread);
 
         render_to_app_sender.send_blocking(render_app).unwrap();
 
@@ -321,28 +324,49 @@ impl Plugin for PipelinedRenderingPlugin {
                             })
                             .pop(),
                     };
-                    let Some(Ok(mut render_app)) = sent_app else {
+                    let Some(Ok(render_app)) = sent_app else {
                         break;
                     };
 
-                    {
-                        #[cfg(feature = "trace")]
-                        let _sub_app_span =
-                            bevy_log::info_span!("sub app", name = ?RenderApp).entered();
-                        progress.begin();
-                        render_app.update();
-                    }
-
-                    if render_to_app_sender.send_blocking(render_app).is_err() {
+                    if !update_and_return(render_app, &render_to_app_sender, &progress) {
                         break;
                     }
-                    progress.end();
                 }
 
                 bevy_log::debug!("exiting pipelined rendering thread");
             })
             .expect("Failed to create render thread");
     }
+}
+
+/// Runs one render frame, sends the render app back to the main app, then runs the frame tail, so
+/// the tail's work overlaps the next extraction. Returns `false` when the main app is gone.
+///
+/// `progress` times the update up to the send, which is when the main app gets the render app
+/// back; the frame tail runs after that and is not part of the prediction.
+fn update_and_return(
+    mut render_app: SubApp,
+    sender: &Sender<SubApp>,
+    progress: &RenderProgress,
+) -> bool {
+    {
+        #[cfg(feature = "trace")]
+        let _sub_app_span = bevy_log::info_span!("sub app", name = ?RenderApp).entered();
+        progress.begin();
+        render_app.update();
+    }
+    let tail = render_app
+        .world()
+        .get_resource::<crate::renderer::RenderFrameTail>()
+        .cloned();
+    if sender.send_blocking(render_app).is_err() {
+        return false;
+    }
+    progress.end();
+    if let Some(tail) = tail {
+        tail.run();
+    }
+    true
 }
 
 // This function waits for the rendering world to be received,
@@ -448,6 +472,31 @@ mod tests {
         fn drop(&mut self) {
             panic!("render app drop panic");
         }
+    }
+
+    /// The main app gets the render app back while the frame tail's work is still running.
+    #[test]
+    fn the_frame_tail_runs_after_the_render_app_is_sent_back() {
+        let (sender, receiver) = async_channel::bounded::<SubApp>(1);
+        let tail = crate::renderer::RenderFrameTail::default();
+        let mut render_app = SubApp::new();
+        render_app.insert_resource(tail.clone());
+        let (release, released) = mpsc::channel::<()>();
+        let (ran, tail_ran) = mpsc::channel::<()>();
+        // Blocks until the main side has the render app, so running it before the send times out.
+        tail.defer(move || {
+            released.recv_timeout(TIMEOUT).unwrap();
+            ran.send(()).unwrap();
+        });
+        let render_thread =
+            thread::spawn(move || update_and_return(render_app, &sender, &RenderProgress::new()));
+
+        let returned = receiver.recv_blocking().unwrap();
+        assert!(tail_ran.try_recv().is_err());
+        release.send(()).unwrap();
+        tail_ran.recv_timeout(TIMEOUT).unwrap();
+        assert!(render_thread.join().unwrap());
+        drop(returned);
     }
 
     #[test]

@@ -125,10 +125,15 @@ impl ExtractedWindow {
     }
 
     pub fn present(&mut self, queue: &RenderQueue) {
+        self.present_with(|surface_texture| surface_texture.present(queue));
+    }
+
+    /// Takes this frame's swap chain texture, if any, and hands it to `present`.
+    pub fn present_with(&mut self, present: impl FnOnce(SurfaceTexture)) {
         present_frame(
             self.swap_chain_texture.take(),
             &mut self.needs_initial_present,
-            |surface_texture| surface_texture.present(queue),
+            present,
         );
     }
 }
