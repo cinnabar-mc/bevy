@@ -67,7 +67,14 @@ impl SystemExecutor for SingleThreadedExecutor {
         self.deferred_systems = FixedBitSet::with_capacity(sys_count);
         self.sync_points = FixedBitSet::with_capacity(sys_count);
         self.in_conditioned_sets = FixedBitSet::with_capacity(sys_count);
-        for (index, sets) in schedule.sets_with_conditions_of_systems.iter().enumerate() {
+        // The schedule sizes this list by the schedule graph's systems, which can outnumber the
+        // systems it runs; only the first `sys_count` entries belong to them.
+        for (index, sets) in schedule
+            .sets_with_conditions_of_systems
+            .iter()
+            .take(sys_count)
+            .enumerate()
+        {
             self.in_conditioned_sets.set(index, !sets.is_clear());
         }
         for (index, system) in schedule.systems.iter().enumerate() {
@@ -417,6 +424,18 @@ mod tests {
 
     fn push(n: usize) -> impl FnMut(ResMut<Seen>) {
         move |mut seen: ResMut<Seen>| seen.0.push(n)
+    }
+
+    #[test]
+    fn init_accepts_more_conditioned_set_entries_than_systems() {
+        use crate::schedule::{executor::SystemSchedule, SystemExecutor};
+        use fixedbitset::FixedBitSet;
+
+        let mut schedule = SystemSchedule::new();
+        let mut sets = FixedBitSet::with_capacity(1);
+        sets.insert(0);
+        schedule.sets_with_conditions_of_systems.push(sets);
+        SingleThreadedExecutor::new().init(&schedule);
     }
 
     #[test]
