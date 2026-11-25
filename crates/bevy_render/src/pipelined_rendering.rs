@@ -1,7 +1,7 @@
 use core::panic::AssertUnwindSafe;
 use std::panic::{catch_unwind, resume_unwind};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TryRecvError};
 
 use bevy_app::{App, AppExit, Plugin, SubApp};
 use bevy_derive::AppLabel;
@@ -53,6 +53,14 @@ impl RenderAppChannels {
     pub fn send_blocking(&mut self, render_app: SubApp) {
         self.app_to_render_sender.send_blocking(render_app).unwrap();
         self.render_app_in_render_thread = true;
+    }
+
+    /// Takes the `render_app` if the rendering thread has already sent it back, without waiting.
+    /// [`TryRecvError::Closed`] means the render thread has panicked.
+    pub fn try_recv(&mut self) -> Result<SubApp, TryRecvError> {
+        let render_app = self.render_to_app_receiver.try_recv()?;
+        self.render_app_in_render_thread = false;
+        Ok(render_app)
     }
 
     /// Receive the `render_app` from the rendering thread.
@@ -216,17 +224,35 @@ impl Plugin for PipelinedRenderingPlugin {
 
 // This function waits for the rendering world to be received,
 // runs extract, and then sends the rendering world back to the render thread.
+/// Takes the render app back from the rendering thread, or `None` if that thread has panicked.
+///
+/// When the render thread has already sent it back, it is taken at once. Otherwise this waits in
+/// a task scope that also runs the main-thread tasks the render world may still need, which a
+/// render thread that is not finished can be waiting for. A render thread that has sent the app
+/// back waits for nothing, and its queued main-thread tasks run at the next tick of the task
+/// pools, so the ready case skips the scope and the worker wake-up that scheduling its task costs.
+fn receive_render_app(
+    render_channels: &mut RenderAppChannels,
+    main_thread_executor: &MainThreadExecutor,
+) -> Option<SubApp> {
+    match render_channels.try_recv() {
+        Ok(render_app) => return Some(render_app),
+        Err(TryRecvError::Closed) => return None,
+        Err(TryRecvError::Empty) => {}
+    }
+    ComputeTaskPool::get()
+        .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
+            s.spawn(async { render_channels.recv().await });
+        })
+        .pop()
+        .unwrap()
+}
+
 fn renderer_extract(app_world: &mut World, _world: &mut World) {
     app_world.resource_scope(|world, main_thread_executor: Mut<MainThreadExecutor>| {
         world.resource_scope(|world, mut render_channels: Mut<RenderAppChannels>| {
-            // we use a scope here to run any main thread tasks that the render world still needs to run
-            // while we wait for the render world to be received.
-            if let Some(mut render_app) = ComputeTaskPool::get()
-                .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
-                    s.spawn(async { render_channels.recv().await });
-                })
-                .pop()
-                .unwrap()
+            if let Some(mut render_app) =
+                receive_render_app(&mut render_channels, &main_thread_executor)
             {
                 render_app.extract(world);
 
@@ -307,6 +333,46 @@ mod tests {
         fn drop(&mut self) {
             panic!("render app drop panic");
         }
+    }
+
+    #[test]
+    fn a_render_app_already_sent_back_is_taken_without_waiting() {
+        run_on_main_thread(|| {
+            let executor = MainThreadExecutor::new();
+            let (app_to_render_sender, app_to_render_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let (render_to_app_sender, render_to_app_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let mut channels = RenderAppChannels::new(
+                app_to_render_sender,
+                render_to_app_receiver,
+                executor.clone(),
+            );
+            channels.send_blocking(SubApp::new());
+            // The render thread finished its update and sent the app back.
+            let render_app = app_to_render_receiver.recv_blocking().unwrap();
+            render_to_app_sender.send_blocking(render_app).unwrap();
+
+            assert!(receive_render_app(&mut channels, &executor).is_some());
+            assert!(!channels.render_app_in_render_thread);
+
+            // A render thread that has gone away reports a panic.
+            drop(render_to_app_sender);
+            channels.send_blocking(SubApp::new());
+            assert!(receive_render_app(&mut channels, &executor).is_none());
+            channels.render_app_in_render_thread = false;
+        });
+    }
+
+    #[test]
+    fn waiting_for_the_render_app_runs_the_main_thread_tasks_it_needs() {
+        run_on_main_thread(|| {
+            let (mut channels, render_thread) = start_render_thread(SubApp::new());
+            let executor = channels.main_thread_executor.clone();
+            // The render thread holds the app until a main-thread task has run.
+            assert!(receive_render_app(&mut channels, &executor).is_some());
+            render_thread.join().unwrap();
+        });
     }
 
     #[test]
