@@ -1,7 +1,9 @@
 use core::panic::AssertUnwindSafe;
 use std::panic::{catch_unwind, resume_unwind};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TryRecvError};
+use bevy_platform::time::Instant;
+use core::time::Duration;
 
 use bevy_app::{App, AppExit, Plugin, SubApp};
 use bevy_derive::AppLabel;
@@ -198,14 +200,20 @@ impl Plugin for PipelinedRenderingPlugin {
                 let _span = bevy_log::info_span!("render thread").entered();
 
                 let compute_task_pool = ComputeTaskPool::get();
+                let spin = render_app_spin(
+                    std::thread::available_parallelism().map_or(1, core::num::NonZero::get),
+                );
                 loop {
                     // Take a render app that is already waiting without a scope. Otherwise run a
                     // scope here to allow main world to use this thread while it's waiting for
                     // the render app. The receive runs on this thread's scope executor, so
                     // waiting does not wake a pool worker just to poll the channel.
-                    let sent_app = match app_to_render_receiver.try_recv() {
-                        Ok(render_app) => Some(Ok(render_app)),
-                        Err(_) => compute_task_pool
+                    // Poll briefly first: the main app usually sends the app back within tens of
+                    // microseconds, and blocking would add a wake-up on each side of the serial
+                    // hand-off.
+                    let sent_app = match spin_recv(&app_to_render_receiver, spin) {
+                        Some(render_app) => Some(Ok(render_app)),
+                        None => compute_task_pool
                             .scope(|s| {
                                 s.spawn_on_scope(async { app_to_render_receiver.recv().await });
                             })
@@ -223,6 +231,35 @@ impl Plugin for PipelinedRenderingPlugin {
                 bevy_log::debug!("exiting pipelined rendering thread");
             })
             .expect("Failed to create render thread");
+    }
+}
+
+/// How long the render thread polls for the next render app before it blocks on the channel: long
+/// enough to cover the main app's usual extraction, and zero where the poll would take a hardware
+/// thread the main app or its task pool needs.
+fn render_app_spin(hardware_threads: usize) -> Duration {
+    if hardware_threads >= 4 {
+        Duration::from_micros(50)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Takes the next render app if it arrives within `budget`, or `None` so the caller blocks for it.
+/// A closed channel also returns `None`; the blocking receive then reports it.
+fn spin_recv(receiver: &Receiver<SubApp>, budget: Duration) -> Option<SubApp> {
+    let start = Instant::now();
+    loop {
+        match receiver.try_recv() {
+            Ok(render_app) => return Some(render_app),
+            Err(TryRecvError::Closed) => return None,
+            Err(TryRecvError::Empty) if start.elapsed() >= budget => return None,
+            Err(TryRecvError::Empty) => {
+                for _ in 0..64 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
     }
 }
 
@@ -347,6 +384,33 @@ mod tests {
         fn drop(&mut self) {
             panic!("render app drop panic");
         }
+    }
+
+    #[test]
+    fn spin_recv_takes_an_app_sent_while_it_polls() {
+        let (sender, receiver) = async_channel::bounded::<SubApp>(1);
+        let main = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            sender.send_blocking(SubApp::new()).unwrap();
+            sender
+        });
+        assert!(spin_recv(&receiver, TIMEOUT).is_some());
+        drop(main.join().unwrap());
+    }
+
+    #[test]
+    fn spin_recv_gives_up_after_its_budget_or_on_a_closed_channel() {
+        let (sender, receiver) = async_channel::bounded::<SubApp>(1);
+        assert!(spin_recv(&receiver, Duration::from_micros(10)).is_none());
+        assert!(spin_recv(&receiver, Duration::ZERO).is_none());
+        drop(sender);
+        assert!(spin_recv(&receiver, TIMEOUT).is_none());
+    }
+
+    #[test]
+    fn render_thread_spins_only_with_hardware_threads_to_spare() {
+        assert_eq!(render_app_spin(2), Duration::ZERO);
+        assert!(render_app_spin(4) > Duration::ZERO);
     }
 
     /// The main app gets the render app back while the frame tail's work is still running.
