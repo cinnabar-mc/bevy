@@ -25,6 +25,14 @@ bevy_reflect = { path = "../bevy_reflect", version = "0.20.0" }
 bevy_time = { path = "../bevy_time", version = "0.20.0" }
 bevy_utils = { path = "../bevy_utils", version = "0.20.0" }
 
+[dev-dependencies]
+bevy_ecs = { path = "../bevy_ecs", version = "0.20.0", features = [
+  "multi_threaded",
+] }
+bevy_tasks = { path = "../bevy_tasks", version = "0.20.0", features = [
+  "multi_threaded",
+] }
+
 [lints]
 workspace = true
 
