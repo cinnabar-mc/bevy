@@ -225,6 +225,11 @@ where
     }
 
     #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.a.may_apply_deferred() || self.b.may_apply_deferred()
+    }
+
+    #[inline]
     fn queue_deferred(&mut self, mut world: crate::world::DeferredWorld) {
         self.a.queue_deferred(world.reborrow());
         self.b.queue_deferred(world);
@@ -525,6 +530,11 @@ where
     fn apply_deferred(&mut self, world: &mut World) {
         self.a.apply_deferred(world);
         self.b.apply_deferred(world);
+    }
+
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.a.may_apply_deferred() || self.b.may_apply_deferred()
     }
 
     fn queue_deferred(&mut self, mut world: crate::world::DeferredWorld) {

@@ -417,6 +417,15 @@ where
     }
 
     #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        match &self.inner {
+            BuilderSystemInner::Initialized { system, .. } => system.may_apply_deferred(),
+            // Not built yet: its parameters are unknown.
+            BuilderSystemInner::Uninitialized { .. } | BuilderSystemInner::Invalid => true,
+        }
+    }
+
+    #[inline]
     fn queue_deferred(&mut self, world: DeferredWorld) {
         match &mut self.inner {
             BuilderSystemInner::Initialized { system, .. } => system.queue_deferred(world),
