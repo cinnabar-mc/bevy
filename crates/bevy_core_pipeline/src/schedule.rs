@@ -283,12 +283,18 @@ impl Display for RootView {
     }
 }
 
+/// Submits the graph's pending command buffers, in the render frame tail when
+/// [`bevy_render::renderer::frame_tail_submission`] allows it.
 pub(crate) fn submit_pending_command_buffers(
     world: &mut World,
     state: &mut SystemState<(ResMut<PendingCommandBuffers>, Res<RenderQueue>)>,
 ) {
+    let tail_submission = bevy_render::renderer::frame_tail_submission(world);
     let (mut pending, queue) = state.get_mut(world).unwrap();
-    pending.submit(&queue);
+    match tail_submission {
+        Some((tail, submission)) => pending.submit_in_tail(&queue, &tail, &submission),
+        None => pending.submit(&queue),
+    }
 }
 
 pub(crate) fn handle_uncovered_swap_chains(
