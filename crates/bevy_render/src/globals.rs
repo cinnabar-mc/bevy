@@ -6,7 +6,7 @@ use crate::{
 };
 use bevy_app::{App, Plugin};
 use bevy_diagnostic::FrameCount;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{component::Mutable, prelude::*};
 use bevy_reflect::prelude::*;
 use bevy_shader::load_shader_library;
 use bevy_time::Time;
@@ -30,11 +30,23 @@ impl Plugin for GlobalsPlugin {
 }
 
 fn extract_frame_count(mut commands: Commands, frame_count: Extract<Res<FrameCount>>) {
-    commands.insert_resource(**frame_count);
+    commands.queue(write_resource(**frame_count));
 }
 
+/// Copies the main world's [`Time`] into the render world when the extraction commands apply.
 fn extract_time(mut commands: Commands, time: Extract<Res<Time>>) {
-    commands.insert_resource(**time);
+    commands.queue(write_resource(**time));
+}
+
+/// Stores `value` as the render world's `R`. Once the render world has one, it is assigned in
+/// place: the same value, marked changed at the same tick as a reinsertion, without reinserting
+/// the resource. Neither [`Time`] nor [`FrameCount`] has hooks or observers that a reinsertion
+/// would run.
+fn write_resource<R: Resource<Mutability = Mutable>>(value: R) -> impl FnOnce(&mut World) {
+    move |world: &mut World| match world.get_resource_mut::<R>() {
+        Some(mut current) => *current = value,
+        None => world.insert_resource(value),
+    }
 }
 
 /// Contains global values useful when writing shaders.
@@ -77,4 +89,39 @@ fn prepare_globals_buffer(
     globals_buffer
         .buffer
         .write_buffer(&render_device, &render_queue);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{change_detection::DetectChanges, world::CommandQueue};
+    use core::time::Duration;
+
+    #[test]
+    fn a_resource_written_in_place_matches_a_reinsertion() {
+        let ticked = |seconds| {
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs(seconds));
+            time
+        };
+        let mut assigned = World::new();
+        let mut reinserted = World::new();
+        write_resource(ticked(1))(&mut assigned);
+        reinserted.insert_resource(ticked(1));
+        for world in [&mut assigned, &mut reinserted] {
+            world.increment_change_tick();
+        }
+
+        let mut queue = CommandQueue::default();
+        queue.push(write_resource(ticked(2)));
+        queue.apply(&mut assigned);
+        reinserted.insert_resource(ticked(2));
+
+        let state = |world: &World| {
+            let time = world.resource_ref::<Time>();
+            (time.elapsed(), time.added(), time.last_changed())
+        };
+        assert_eq!(state(&assigned), state(&reinserted));
+        assert_eq!(state(&assigned).0, Duration::from_secs(2));
+    }
 }
