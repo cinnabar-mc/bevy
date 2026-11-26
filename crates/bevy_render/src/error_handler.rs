@@ -191,6 +191,12 @@ pub(crate) fn update_state(main_world: &mut World, render_world: &mut World) {
         render_world.insert_resource(RenderState::Errored(error));
     };
 
+    // A ready renderer needs nothing from the handler, so its state stays in place instead of
+    // being removed and reinserted every frame.
+    if matches!(*render_world.resource::<RenderState>(), RenderState::Ready) {
+        return;
+    }
+
     // Remove the render state so we can provide both worlds to the `RenderErrorHandler`.
     let state = render_world.remove_resource::<RenderState>().unwrap();
 
@@ -232,5 +238,59 @@ pub(crate) fn update_state(main_world: &mut World, render_world: &mut World) {
     // Put the state back if we didn't set a new one
     if render_world.get_resource::<RenderState>().is_none() {
         render_world.insert_resource(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{change_detection::DetectChanges, message::Messages};
+
+    fn worlds(state: RenderState) -> (World, World, DeviceErrorHandler) {
+        let handler = DeviceErrorHandler {
+            device_lost: Arc::new(Mutex::new(None)),
+            uncaptured: Arc::new(Mutex::new(None)),
+        };
+        let shared = DeviceErrorHandler {
+            device_lost: Arc::clone(&handler.device_lost),
+            uncaptured: Arc::clone(&handler.uncaptured),
+        };
+        let mut main_world = World::new();
+        main_world.init_resource::<Messages<AppExit>>();
+        main_world.init_resource::<RenderErrorHandler>();
+        let mut render_world = World::new();
+        render_world.insert_resource(handler);
+        render_world.insert_resource(state);
+        (main_world, render_world, shared)
+    }
+
+    #[test]
+    fn ready_state_is_left_in_place_until_an_error_arrives() {
+        let (mut main_world, mut render_world, errors) = worlds(RenderState::Ready);
+        let changed = render_world.resource_ref::<RenderState>().last_changed();
+        render_world.increment_change_tick();
+
+        update_state(&mut main_world, &mut render_world);
+        assert!(matches!(
+            *render_world.resource::<RenderState>(),
+            RenderState::Ready
+        ));
+        assert_eq!(
+            render_world.resource_ref::<RenderState>().last_changed(),
+            changed
+        );
+        assert!(main_world.resource::<Messages<AppExit>>().is_empty());
+
+        *errors.device_lost.lock().unwrap() =
+            Some((wgpu::DeviceLostReason::Unknown, "lost".into()));
+        update_state(&mut main_world, &mut render_world);
+        assert!(matches!(
+            *render_world.resource::<RenderState>(),
+            RenderState::Errored(RenderError {
+                ty: ErrorType::DeviceLost,
+                ..
+            })
+        ));
+        assert!(!main_world.resource::<Messages<AppExit>>().is_empty());
     }
 }
