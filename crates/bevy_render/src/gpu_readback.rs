@@ -364,9 +364,12 @@ fn prepare_buffers(
     }
 }
 
-/// Returns whether any readback was requested this frame and needs copy commands encoded.
+/// Returns whether any readback was requested this frame and needs copy commands encoded; never
+/// in a render world without GPU readback support.
 pub(crate) fn has_readback_commands(world: &World) -> bool {
-    !world.resource::<GpuReadbacks>().requested.is_empty()
+    world
+        .get_resource::<GpuReadbacks>()
+        .is_some_and(|readbacks| !readbacks.requested.is_empty())
 }
 
 pub(crate) fn submit_readback_commands(world: &World, command_encoder: &mut CommandEncoder) {
