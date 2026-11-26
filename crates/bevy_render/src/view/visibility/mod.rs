@@ -199,6 +199,11 @@ impl RenderVisibleEntitiesClass {
         #[cfg(feature = "trace")]
         let _update_from = info_span!("update_from", name = "update_from").entered();
 
+        // An unchanged list adds and removes nothing, so the current list and its storage stay.
+        if self.entities_cpu_culling == visible_mesh_entities_cpu_culling {
+            return;
+        }
+
         let old_entities_cpu_culling = mem::take(&mut self.entities_cpu_culling);
 
         // March over the old and new visible CPU culling entity lists in
@@ -425,6 +430,37 @@ fn collect_visible_cpu_culled_entities_for_subview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame whose visible list did not change keeps the list's storage and reports no added
+    /// or removed entities; a changed list still diffs against it.
+    #[test]
+    fn an_unchanged_visible_list_keeps_its_storage_and_reports_no_changes() {
+        let pairs: Vec<_> = (1..=3)
+            .map(|bits| {
+                (
+                    Entity::from_bits(bits),
+                    MainEntity::from(Entity::from_bits(bits)),
+                )
+            })
+            .collect();
+        let mut class = RenderVisibleEntitiesClass::default();
+        class.update_cpu_culled_entities(&pairs);
+        assert_eq!(class.added_entities(), &pairs[..]);
+
+        let storage = class.entities_cpu_culling.as_ptr();
+        class.prepare_for_new_frame();
+        class.update_cpu_culled_entities(&pairs);
+        assert_eq!(class.entities_cpu_culling, pairs);
+        assert_eq!(class.entities_cpu_culling.as_ptr(), storage);
+        assert!(class.added_entities().is_empty());
+        assert!(class.removed_entities.is_empty());
+
+        class.prepare_for_new_frame();
+        class.update_cpu_culled_entities(&pairs[..2]);
+        assert_eq!(class.entities_cpu_culling, &pairs[..2]);
+        assert_eq!(class.removed_entities, &pairs[2..]);
+        assert!(class.added_entities().is_empty());
+    }
 
     #[test]
     fn cpu_visible_entity_pair_lookup_uses_main_entity_sort_order() {
