@@ -565,9 +565,12 @@ impl SpecializedRenderPipeline for ScreenshotToScreenPipeline {
 pub(crate) type SubmitScreenshotCommandsState<'w, 's> =
     Query<'w, 's, (MainEntity, &'s ExtractedWindow)>;
 
-/// Returns whether any screenshot was prepared this frame and needs commands encoded.
+/// Returns whether any screenshot was prepared this frame and needs commands encoded; never in a
+/// render world without screenshot support.
 pub(crate) fn has_screenshot_commands(world: &World) -> bool {
-    !world.resource::<RenderScreenshotsPrepared>().is_empty()
+    world
+        .get_resource::<RenderScreenshotsPrepared>()
+        .is_some_and(|prepared| !prepared.is_empty())
 }
 
 pub(crate) fn submit_screenshot_commands(
