@@ -22,6 +22,7 @@ struct CachedTextureMeta {
 #[derive(Clone)]
 pub struct CachedTexture {
     pub texture: Texture,
+    /// A view of the whole texture with the default descriptor, kept as long as the texture.
     pub default_view: TextureView,
 }
 
