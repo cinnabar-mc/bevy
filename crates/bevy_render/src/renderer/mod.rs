@@ -1,3 +1,4 @@
+mod frame_submission;
 mod frame_tail;
 #[cfg(feature = "raw_vulkan_init")]
 pub mod raw_vulkan_init;
@@ -5,6 +6,7 @@ mod render_context;
 mod render_device;
 mod wgpu_wrapper;
 
+pub use frame_submission::{frame_tail_submission, FrameSubmission, SubmitInFrameTail};
 pub use frame_tail::{run_frame_tail, FrameTailOnRenderThread, RenderFrameTail};
 pub use render_context::{
     run_render_schedule, CurrentView, FlushCommands, PendingCommandBuffers, RenderContext,
@@ -107,9 +109,12 @@ pub fn render_system(
     // before presentation.
     if !world.resource::<PendingCommandBuffers>().is_empty() {
         let render_queue = world.resource::<RenderQueue>().clone();
-        world
-            .resource_mut::<PendingCommandBuffers>()
-            .submit(&render_queue);
+        let tail_submission = frame_tail_submission(world);
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        match tail_submission {
+            Some((tail, submission)) => pending.submit_in_tail(&render_queue, &tail, &submission),
+            None => pending.submit(&render_queue),
+        }
     }
 
     {
