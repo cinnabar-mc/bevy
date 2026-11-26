@@ -64,6 +64,10 @@ impl<L: AppLabel + Default + Copy + Eq> Plugin for ExtractPlugin<L> {
             ..default()
         });
         extract_schedule.set_apply_final_deferred(false);
+        // Extraction holds the main world, so its systems are on the frame's critical path.
+        // They are many and small, and dispatching them to task pool threads costs more wall
+        // time than running them in order on the extracting thread.
+        extract_schedule.set_executor(bevy_ecs::schedule::SingleThreadedExecutor::new());
 
         sub_app
             .add_schedule((self.base_schedule)())
@@ -212,6 +216,50 @@ mod test {
         ) -> Option<Self::Out> {
             Some((RenderComponent, RenderComponentExtra))
         }
+    }
+
+    #[derive(Resource, Default)]
+    struct ExtractThreads(std::sync::Mutex<Vec<std::thread::ThreadId>>);
+
+    fn record_thread(threads: Res<ExtractThreads>) {
+        threads.0.lock().unwrap().push(std::thread::current().id());
+    }
+
+    #[test]
+    fn extract_systems_run_on_the_extracting_thread() {
+        bevy_tasks::ComputeTaskPool::get_or_init(|| {
+            bevy_tasks::TaskPoolBuilder::new().num_threads(4).build()
+        });
+        let mut app = App::new();
+        app.add_plugins(ExtractPlugin::<ExtractApp>::new(
+            |_, _| {},
+            MySchedule::base_schedule,
+            MySchedule.intern(),
+            MyScheduleSystems::ExtractCommands.intern(),
+            MyScheduleSystems::PostCleanup.intern(),
+        ));
+        let sub_app = app.get_sub_app_mut(ExtractApp).unwrap();
+        sub_app.update_schedule = Some(MySchedule.intern());
+        sub_app.init_resource::<ExtractThreads>();
+        for _ in 0..16 {
+            sub_app.add_systems(crate::ExtractSchedule, record_thread);
+        }
+
+        app.update();
+
+        let threads = app
+            .get_sub_app(ExtractApp)
+            .unwrap()
+            .world()
+            .resource::<ExtractThreads>()
+            .0
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(threads.len(), 16);
+        assert!(threads
+            .iter()
+            .all(|thread| *thread == std::thread::current().id()));
     }
 
     #[test]
