@@ -18,7 +18,7 @@ use crate::{
     prelude::Component,
     query::{DebugCheckedUnwrap, QueryAccessError, ReleaseStateQueryData, SingleEntityQueryData},
     resource::{Resource, ResourceEntities},
-    storage::{ComponentSparseSet, Storages, Table},
+    storage::{ComponentSparseSet, SetVersions, Storages, Table, TableRow},
     system::Commands,
 };
 use bevy_platform::sync::{
@@ -736,12 +736,22 @@ impl<'w> UnsafeWorldCell<'w> {
         component_id: ComponentId,
         cache: &mut ResourcePointerCache,
     ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
-        if let Some(pointers) = &cache.0
-            && pointers.is_current()
-        {
-            // SAFETY: An unchanged structure version means the pointers still address this
-            // resource's value and ticks in this world; the caller upholds access.
-            return Some(unsafe { pointers.cells() });
+        if let Some(pointers) = &mut cache.0 {
+            let current = match pointers.check() {
+                Validity::Current => true,
+                Validity::Confirm => {
+                    // SAFETY: Only the set's sparse index is read, which the caller's access to
+                    // the resource covers.
+                    unsafe { self.fetch_sparse_set(component_id) }
+                        .is_some_and(|set| pointers.confirm(set))
+                }
+                Validity::Stale => false,
+            };
+            if current {
+                // SAFETY: The pointers still address this resource's value and ticks in this
+                // world; the caller upholds access.
+                return Some(unsafe { pointers.cells() });
+            }
         }
         // SAFETY: Upheld by the caller.
         unsafe { self.refresh_resource_pointers(component_id, cache) }
@@ -758,7 +768,7 @@ impl<'w> UnsafeWorldCell<'w> {
         component_id: ComponentId,
         cache: &mut ResourcePointerCache,
     ) -> Option<(Ptr<'w>, ComponentTickCells<'w>)> {
-        cache.0 = None;
+        let previous = cache.0.take();
         // SAFETY: We have permission to access the resource of `component_id`.
         let entity = unsafe { self.resource_entities() }.get(component_id)?;
         let storage_type = self.components().get_info(component_id)?.storage_type();
@@ -770,9 +780,9 @@ impl<'w> UnsafeWorldCell<'w> {
         let (value, cells) =
             unsafe { get_component_and_ticks(self, component_id, storage_type, entity, location) }?;
         if storage_type == StorageType::SparseSet {
-            // SAFETY: Only the set's structure version is read.
+            // SAFETY: Only the set's counters and sparse index are read.
             let set = unsafe { self.fetch_sparse_set(component_id) }?;
-            cache.0 = Some(CachedResourcePointers::new(set, value, &cells));
+            cache.0 = CachedResourcePointers::new(set, entity, value, &cells, previous);
         }
         Some((value, cells))
     }
@@ -1544,11 +1554,11 @@ mod tests {
         let id = world.component_id::<Stored>().unwrap();
         let set = world.storages().sparse_sets.get(id).unwrap();
         let reused = cache
-            .as_ref()
-            .is_some_and(CachedResourcePointers::is_current);
+            .as_mut()
+            .is_some_and(|pointers| pointers.is_current(set));
         if !reused {
             let (value, cells) = set.get_with_ticks(entity).unwrap();
-            *cache = Some(CachedResourcePointers::new(set, value, &cells));
+            *cache = CachedResourcePointers::new(set, entity, value, &cells, cache.take());
         }
         // SAFETY: The pointers are current and `world` is borrowed shared.
         let (value, _) = unsafe { cache.as_ref().unwrap().cells() };
@@ -1576,14 +1586,13 @@ mod tests {
             "unchanged storage reuses the pointers"
         );
 
-        // Growing well past the initial capacity reallocates the dense storage.
-        let (_, before, _) = resolve(&world, tracked, &mut cache);
+        // Growing well past the initial capacity reallocates the dense storage (which may or may
+        // not move it), so the pointers are read again.
         let grown: Vec<_> = (0..100)
             .map(|i| world.spawn(Stored(100 + i)).id())
             .collect();
-        let (reused, after, value) = resolve(&world, tracked, &mut cache);
+        let (reused, _, value) = resolve(&world, tracked, &mut cache);
         assert!(!reused);
-        assert_ne!(before, after, "the storage moved");
         assert_eq!(value, 7);
 
         // Removing values before it swaps the last stored value into their slots.
@@ -1596,6 +1605,37 @@ mod tests {
         assert!(!reused);
         assert_ne!(before, after, "the value was relocated");
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn cached_pointers_survive_reinsertion_into_the_same_row() {
+        let mut world = World::new();
+        let kept = world.spawn(Stored(1)).id();
+        let tracked = world.spawn(Stored(2)).id();
+        let mut cache = None;
+        assert!(!resolve(&world, tracked, &mut cache).0);
+
+        // Taking the last value out and putting a new one back moves nothing, so the cached
+        // pointers address the new value without a lookup.
+        let taken = world.entity_mut(tracked).take::<Stored>().unwrap();
+        assert_eq!(taken.0, 2);
+        world.entity_mut(tracked).insert(Stored(3));
+        let (reused, _, value) = resolve(&world, tracked, &mut cache);
+        assert!(reused);
+        assert_eq!(value, 3);
+
+        // While the value is gone, or after another entity took its row, the cache misses.
+        world.entity_mut(tracked).remove::<Stored>();
+        let id = world.component_id::<Stored>().unwrap();
+        let set = world.storages().sparse_sets.get(id).unwrap();
+        assert!(!cache.as_mut().unwrap().is_current(set));
+        assert!(set.get_with_ticks(tracked).is_none());
+        let other = world.spawn(Stored(4)).id();
+        let set = world.storages().sparse_sets.get(id).unwrap();
+        assert_eq!(set.row(other), cache.as_ref().map(|pointers| pointers.row));
+        assert!(!cache.as_mut().unwrap().is_current(set));
+        assert_eq!(resolve(&world, other, &mut None).2, 4);
+        assert_eq!(resolve(&world, kept, &mut None).2, 1);
     }
 
     #[test]
@@ -1623,14 +1663,29 @@ mod tests {
     }
 }
 
+/// What [`CachedResourcePointers::check`] can tell from the set's counters.
+enum Validity {
+    /// Nothing moved or was removed: the pointers are current.
+    Current,
+    /// Something was removed: current if the entity still has its value at the cached row.
+    Confirm,
+    /// Values moved: the pointers must be read again.
+    Stale,
+}
+
 /// Pointers to one resource's value and change ticks that a system parameter keeps between runs,
 /// so a resource whose sparse-set storage has not changed needs no lookup.
 #[derive(Default)]
 pub(crate) struct ResourcePointerCache(Option<CachedResourcePointers>);
 
 struct CachedResourcePointers {
-    version: Arc<AtomicU64>,
-    seen: u64,
+    versions: Arc<SetVersions>,
+    /// [`SetVersions::moved`] when the pointers were read.
+    moved: u64,
+    /// [`SetVersions::removed`] when the entity's row was last confirmed.
+    removed: u64,
+    entity: Entity,
+    row: TableRow,
     value: NonNull<u8>,
     added: NonNull<UnsafeCell<Tick>>,
     changed: NonNull<UnsafeCell<Tick>>,
@@ -1645,28 +1700,74 @@ unsafe impl Send for CachedResourcePointers {}
 unsafe impl Sync for CachedResourcePointers {}
 
 impl CachedResourcePointers {
-    /// Keeps pointers just read from `set` together with its current structure version.
-    fn new(set: &ComponentSparseSet, value: Ptr<'_>, cells: &ComponentTickCells<'_>) -> Self {
-        let version = set.structure_version();
-        Self {
-            seen: version.load(Ordering::Relaxed),
-            version: version.clone(),
+    /// Keeps pointers just read from `set` for `entity` together with the set's counters and the
+    /// entity's row. Reuses `previous`'s handle on the counters when it came from the same set,
+    /// sparing the reference-count updates.
+    fn new(
+        set: &ComponentSparseSet,
+        entity: Entity,
+        value: Ptr<'_>,
+        cells: &ComponentTickCells<'_>,
+        previous: Option<Self>,
+    ) -> Option<Self> {
+        let current = set.structure_version();
+        let versions = match previous {
+            Some(previous) if Arc::ptr_eq(&previous.versions, current) => previous.versions,
+            _ => current.clone(),
+        };
+        Some(Self {
+            moved: versions.moved.load(Ordering::Relaxed),
+            removed: versions.removed.load(Ordering::Relaxed),
+            versions,
+            entity,
+            row: set.row(entity)?,
             // SAFETY: `Ptr` is never null.
             value: unsafe { NonNull::new_unchecked(value.as_ptr().cast_mut()) },
             added: NonNull::from(cells.added),
             changed: NonNull::from(cells.changed),
             changed_by: cells.changed_by.map(NonNull::from),
+        })
+    }
+
+    /// Whether the pointers still address the resource's value, from the set's counters alone.
+    #[inline]
+    fn check(&self) -> Validity {
+        if self.versions.moved.load(Ordering::Relaxed) != self.moved {
+            Validity::Stale
+        } else if self.versions.removed.load(Ordering::Relaxed) != self.removed {
+            Validity::Confirm
+        } else {
+            Validity::Current
         }
     }
 
-    /// Whether the sparse set holding the resource is unchanged since the pointers were read.
+    /// Confirms, after a removal from `set` (the set the pointers came from), that the entity
+    /// still has its value at the cached row: no value moved, so the pointers then address it.
+    /// Removing the resource and inserting it again into the same row keeps them valid.
     #[inline]
-    fn is_current(&self) -> bool {
-        self.version.load(Ordering::Relaxed) == self.seen
+    fn confirm(&mut self, set: &ComponentSparseSet) -> bool {
+        let removed = self.versions.removed.load(Ordering::Relaxed);
+        let current = self.versions.moved.load(Ordering::Relaxed) == self.moved
+            && set.row(self.entity) == Some(self.row);
+        if current {
+            self.removed = removed;
+        }
+        current
+    }
+
+    /// Whether the pointers are current, checking `set` (the set they came from) when needed.
+    #[cfg(test)]
+    fn is_current(&mut self, set: &ComponentSparseSet) -> bool {
+        match self.check() {
+            Validity::Current => true,
+            Validity::Confirm => self.confirm(set),
+            Validity::Stale => false,
+        }
     }
 
     /// # Safety
-    /// [`Self::is_current`] must hold, and the caller must hold access to the resource for `'w`.
+    /// [`Self::check`] (with [`Self::confirm`] when asked) must have found the pointers current,
+    /// and the caller must hold access to the resource for `'w`.
     #[inline]
     unsafe fn cells<'w>(&self) -> (Ptr<'w>, ComponentTickCells<'w>) {
         // SAFETY: Upheld by the caller; the pointers came from live references into the storage.
