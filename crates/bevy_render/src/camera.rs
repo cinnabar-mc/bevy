@@ -709,16 +709,20 @@ struct WrittenCameraArchetype(Option<ArchetypeId>);
 /// including required components registered by plugins, the camera's archetype is recorded.
 /// While the camera stays in that archetype it still has all of them, so the next writes assign
 /// in place: the same values, marked changed at the same tick, without the bundle insert's
-/// lookups or its replace and insert hooks and observers. None are registered for these
-/// components; an `Insert` observer added for one would only see the first extraction. Adding or
+/// lookups. An insert into that archetype would run no hook or observer unless
+/// [`insert_runs_lifecycle_callbacks`] says so, which is checked on every write so observers added
+/// later still see each one; while any would run, the bundle is inserted instead. Adding or
 /// removing any component moves the camera to another archetype, and the next write inserts the
 /// bundle again, which also restores any missing required component.
 fn write_camera_components(components: CameraComponents) -> impl EntityCommand<Out = ()> {
     move |mut entity: EntityWorldMut| {
-        let archetype = entity.archetype().id();
-        if entity
-            .get::<WrittenCameraArchetype>()
-            .is_some_and(|written| written.0 == Some(archetype))
+        let archetype = entity.archetype();
+        let in_place = !insert_runs_lifecycle_callbacks(archetype);
+        let archetype = archetype.id();
+        if in_place
+            && entity
+                .get::<WrittenCameraArchetype>()
+                .is_some_and(|written| written.0 == Some(archetype))
         {
             let (camera, compositing_space, view, visible_entities, frustum) = components;
             // The recorded archetype holds every component of the bundle.
@@ -750,6 +754,17 @@ fn write_camera_components(components: CameraComponents) -> impl EntityCommand<O
             written.0 = Some(archetype);
         }
     }
+}
+
+/// Whether inserting components that an entity in `archetype` already has would run an insert or
+/// discard hook or observer. Bevy runs those only for archetypes flagged with them, so while this
+/// is `false` an in-place assignment is indistinguishable from the insert. The flags cover every
+/// component of the archetype, so this can say `true` for a hook the insert would not run.
+pub(crate) fn insert_runs_lifecycle_callbacks(archetype: &Archetype) -> bool {
+    archetype.has_insert_hook()
+        || archetype.has_discard_hook()
+        || archetype.has_insert_observer()
+        || archetype.has_discard_observer()
 }
 
 /// Inserts `value` when the extracted camera has one, and otherwise removes `T` if present.
@@ -1382,22 +1397,54 @@ mod tests {
         assert_eq!(world.get::<ExtractedCamera>(camera).unwrap().order, 3);
     }
 
+    /// An `Insert` observer sees every write, including writes into an archetype the camera
+    /// already had, and after the camera changes archetype.
     #[test]
-    fn a_camera_that_changed_archetype_is_inserted_again_then_assigned_in_place() {
+    fn an_insert_observer_sees_every_camera_write() {
         let mut world = World::new();
         world.init_resource::<Inserts>();
         world.add_observer(count_inserts);
         let camera = world.spawn_empty().id();
         write(&mut world, camera, camera_components(1));
         write(&mut world, camera, camera_components(2));
-        assert_eq!(world.resource::<Inserts>().0, 1);
+        assert_eq!(world.resource::<Inserts>().0, 2);
 
         world.entity_mut(camera).insert(MipBias(1.0));
         write(&mut world, camera, camera_components(3));
         write(&mut world, camera, camera_components(4));
 
-        assert_eq!(world.resource::<Inserts>().0, 2);
+        assert_eq!(world.resource::<Inserts>().0, 4);
         assert_eq!(world.get::<ExtractedCamera>(camera).unwrap().order, 4);
+    }
+
+    #[derive(Resource, Default)]
+    struct SeenViewports(Vec<UVec4>);
+
+    /// An observer added after the camera's writes started assigning in place still sees the
+    /// next write, such as a viewport change that leaves the archetype unchanged.
+    #[test]
+    fn an_observer_added_later_sees_the_next_camera_write() {
+        let mut world = World::new();
+        world.init_resource::<SeenViewports>();
+        let camera = world.spawn_empty().id();
+        write(&mut world, camera, camera_components(1));
+        write(&mut world, camera, camera_components(2));
+        world.add_observer(
+            |insert: On<Insert<ExtractedView>>,
+             views: Query<&ExtractedView>,
+             mut seen: ResMut<SeenViewports>| {
+                seen.0.push(views.get(insert.entity).unwrap().viewport);
+            },
+        );
+
+        let mut moved = camera_components(3);
+        moved.2.viewport = UVec4::new(4, 4, 8, 8);
+        write(&mut world, camera, moved);
+
+        assert_eq!(
+            world.resource::<SeenViewports>().0,
+            [UVec4::new(4, 4, 8, 8)]
+        );
     }
 
     #[test]

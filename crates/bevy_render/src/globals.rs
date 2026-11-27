@@ -40,12 +40,18 @@ fn extract_time(mut commands: Commands, time: Extract<Res<Time>>) {
 
 /// Stores `value` as the render world's `R`. Once the render world has one, it is assigned in
 /// place: the same value, marked changed at the same tick as a reinsertion, without reinserting
-/// the resource. Neither [`Time`] nor [`FrameCount`] has hooks or observers that a reinsertion
-/// would run.
+/// the resource. While a reinsertion would run an insert or discard hook or observer, checked on
+/// every write so observers added later see each one, the resource is reinserted instead.
 fn write_resource<R: Resource<Mutability = Mutable>>(value: R) -> impl FnOnce(&mut World) {
-    move |world: &mut World| match world.get_resource_mut::<R>() {
-        Some(mut current) => *current = value,
-        None => world.insert_resource(value),
+    move |world: &mut World| {
+        let in_place = world.resource_entity::<R>().is_some_and(|entity| {
+            !crate::camera::insert_runs_lifecycle_callbacks(world.entity(entity).archetype())
+        });
+        if in_place {
+            *world.resource_mut::<R>() = value;
+        } else {
+            world.insert_resource(value);
+        }
     }
 }
 
@@ -123,5 +129,29 @@ mod tests {
         };
         assert_eq!(state(&assigned), state(&reinserted));
         assert_eq!(state(&assigned).0, Duration::from_secs(2));
+    }
+
+    #[derive(Resource, Default)]
+    struct Inserts(usize);
+
+    /// An observer of the resource's insertion, added after writes started assigning in place,
+    /// sees the next write.
+    #[test]
+    fn an_insert_observer_added_later_sees_the_next_resource_write() {
+        use bevy_ecs::{lifecycle::Insert, observer::On};
+
+        let mut world = World::new();
+        world.init_resource::<Inserts>();
+        write_resource(FrameCount(1))(&mut world);
+        write_resource(FrameCount(2))(&mut world);
+        world.add_observer(|_: On<Insert<FrameCount>>, mut inserts: ResMut<Inserts>| {
+            inserts.0 += 1;
+        });
+
+        write_resource(FrameCount(3))(&mut world);
+        write_resource(FrameCount(4))(&mut world);
+
+        assert_eq!(world.resource::<Inserts>().0, 2);
+        assert_eq!(world.resource::<FrameCount>().0, 4);
     }
 }
