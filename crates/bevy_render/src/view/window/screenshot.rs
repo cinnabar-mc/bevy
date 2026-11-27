@@ -21,8 +21,8 @@ use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget}
 use bevy_color::{ColorToPacked, LinearRgba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    archetype::Archetypes, component::ComponentIdFor, entity::EntityHashMap,
-    message::message_update_system, prelude::*, system::SystemState,
+    component::ComponentIdFor, entity::EntityHashMap, message::message_update_system, prelude::*,
+    system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
 use bevy_log::{error, info, warn};
@@ -253,30 +253,29 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-/// Despawns last frame's captured screenshots. Bevy only adds [`Captured`] in
-/// [`trigger_screenshots`], in `Update`, so no captured entity can appear between this system and
-/// the `ApplyDeferred` it runs before; with none present, the despawn command (which builds a query
-/// each time) is not queued. An app that queues `Captured` itself in `First`, ahead of that flush,
-/// has those entities despawned a frame later. Captured entities hidden by any disabling component
-/// count too, so a queued re-enable still finds the command queued.
-fn clear_screenshots(
-    mut commands: Commands,
-    archetypes: &Archetypes,
-    captured: ComponentIdFor<Captured>,
-) {
-    // The component index lists every archetype holding `Captured`, whatever default query
-    // filters would hide.
-    let any_captured = archetypes
-        .component_index()
-        .get(&captured.get())
-        .is_some_and(|holding| {
-            holding
-                .keys()
-                .any(|&archetype| !archetypes[archetype].is_empty())
-        });
-    if any_captured {
-        commands.despawn_all::<With<Captured>>();
-    }
+/// Despawns last frame's captured screenshots. The despawn checks for captured entities when it
+/// applies, after every command queued ahead of it in the same flush, so a [`Captured`] queued
+/// earlier in that flush is despawned too. With none present it skips the despawn, which builds
+/// a query each time. Captured entities hidden by any disabling component count too, so a queued
+/// re-enable still has them despawned.
+fn clear_screenshots(mut commands: Commands, captured: ComponentIdFor<Captured>) {
+    let captured = captured.get();
+    commands.queue(move |world: &mut World| {
+        // The component index lists every archetype holding `Captured`, whatever default query
+        // filters would hide.
+        let archetypes = world.archetypes();
+        let any_captured = archetypes
+            .component_index()
+            .get(&captured)
+            .is_some_and(|holding| {
+                holding
+                    .keys()
+                    .any(|&archetype| !archetypes[archetype].is_empty())
+            });
+        if any_captured {
+            world.despawn_all::<With<Captured>>();
+        }
+    });
 }
 
 pub fn trigger_screenshots(
@@ -986,5 +985,25 @@ mod tests {
         );
         reenable.run(&mut world);
         assert!(world.get_entity(hidden).is_err());
+    }
+
+    /// A capture queued earlier in the same flush, while no captured entity exists yet, is
+    /// despawned by that flush's cleanup instead of surviving a frame.
+    #[test]
+    fn a_capture_queued_earlier_in_the_same_flush_is_despawned() {
+        let mut world = World::new();
+        let screenshot = world.spawn_empty().id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(screenshot).insert(Captured);
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut world);
+        assert!(world.get_entity(screenshot).is_err());
     }
 }
