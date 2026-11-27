@@ -138,17 +138,6 @@ impl ExtractedWindow {
     }
 }
 
-/// Gives the render window [`PrimaryWindow`] when the extraction commands apply, if it lacks it.
-/// Render systems only filter on the marker; none reads its change ticks or observes its
-/// insertion, so a window that already has it is left alone instead of being given it again every
-/// frame. Checking when the command applies, rather than when it is queued, also restores a marker
-/// that an earlier command in the same flush removed.
-fn mark_primary_window(mut window: EntityWorldMut) {
-    if !window.contains::<PrimaryWindow>() {
-        window.insert(PrimaryWindow);
-    }
-}
-
 fn extract_windows(
     mut commands: Commands,
     mut extracted_windows: Query<&mut ExtractedWindow>,
@@ -160,7 +149,7 @@ fn extract_windows(
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
         if is_primary {
-            commands.entity(render_entity).queue(mark_primary_window);
+            commands.entity(render_entity).insert(PrimaryWindow);
         }
 
         let (new_width, new_height) = (
@@ -642,10 +631,8 @@ mod tests {
         }
     }
 
-    /// A primary marker an earlier command in the same flush removed from the render window is
-    /// given back by that flush's extraction.
-    #[test]
-    fn a_primary_marker_removed_earlier_in_the_same_flush_is_restored() {
+    /// A render world holding `render_window`, with a main world whose primary window maps to it.
+    fn worlds_with_primary_window() -> (World, Entity) {
         let mut render_world = World::new();
         let render_window = render_world.spawn(PrimaryWindow).id();
         let mut main_world = World::new();
@@ -658,6 +645,37 @@ mod tests {
         ));
         render_world.insert_resource(MainWorld::default());
         **render_world.resource_mut::<MainWorld>() = main_world;
+        (render_world, render_window)
+    }
+
+    #[derive(Resource, Default)]
+    struct Inserts(usize);
+
+    /// Every extraction inserts the primary marker, so its insert observers and change detection
+    /// see each frame, as they would with any other extracted component.
+    #[test]
+    fn every_extraction_inserts_the_primary_marker() {
+        use bevy_ecs::{lifecycle::Insert, observer::On};
+
+        let (mut render_world, _) = worlds_with_primary_window();
+        render_world.init_resource::<Inserts>();
+        render_world.add_observer(
+            |_: On<Insert<PrimaryWindow>>, mut inserts: ResMut<Inserts>| {
+                inserts.0 += 1;
+            },
+        );
+        let mut schedule = Schedule::default();
+        schedule.add_systems(extract_windows);
+        schedule.run(&mut render_world);
+        schedule.run(&mut render_world);
+        assert_eq!(render_world.resource::<Inserts>().0, 2);
+    }
+
+    /// A primary marker an earlier command in the same flush removed from the render window is
+    /// given back by that flush's extraction.
+    #[test]
+    fn a_primary_marker_removed_earlier_in_the_same_flush_is_restored() {
+        let (mut render_world, render_window) = worlds_with_primary_window();
 
         let mut schedule = Schedule::default();
         schedule.add_systems(
