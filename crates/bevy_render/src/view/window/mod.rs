@@ -138,6 +138,17 @@ impl ExtractedWindow {
     }
 }
 
+/// Gives the render window [`PrimaryWindow`] when the extraction commands apply, if it lacks it.
+/// Render systems only filter on the marker; none reads its change ticks or observes its
+/// insertion, so a window that already has it is left alone instead of being given it again every
+/// frame. Checking when the command applies, rather than when it is queued, also restores a marker
+/// that an earlier command in the same flush removed.
+fn mark_primary_window(mut window: EntityWorldMut) {
+    if !window.contains::<PrimaryWindow>() {
+        window.insert(PrimaryWindow);
+    }
+}
+
 fn extract_windows(
     mut commands: Commands,
     mut extracted_windows: Query<&mut ExtractedWindow>,
@@ -146,15 +157,10 @@ fn extract_windows(
     mut removed: Extract<RemovedComponents<RawHandleWrapper>>,
     mut removed_primary: Extract<RemovedComponents<PrimaryWindow>>,
     mapper: Extract<Query<&RenderEntity>>,
-    marked_primary: Query<(), With<PrimaryWindow>>,
 ) {
     for (render_entity, window, handle, is_primary) in windows.iter() {
-        // Render systems only filter on the marker; none reads its change ticks or observes its
-        // insertion, so a window that already has it needs no replacement every frame. This
-        // system queues any removal of the marker after this insert itself; only another system
-        // removing it in the same flush would now leave it removed for a frame.
-        if is_primary && !marked_primary.contains(render_entity) {
-            commands.entity(render_entity).insert(PrimaryWindow);
+        if is_primary {
+            commands.entity(render_entity).queue(mark_primary_window);
         }
 
         let (new_width, new_height) = (
@@ -602,4 +608,71 @@ fn present_mode(window: &ExtractedWindow, caps: &wgpu::SurfaceCapabilities) -> w
         info!("PresentMode {present_mode:?} requested but not available. Falling back to {new_present_mode:?}");
     }
     new_present_mode
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{message::Messages, schedule::Schedule};
+    use bevy_extract::MainWorld;
+    use bevy_window::{RawHandleWrapper, WindowWrapper};
+    use wgpu::rwh::{
+        DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+        RawWindowHandle, WebDisplayHandle, WebWindowHandle, WindowHandle,
+    };
+
+    /// A window handle that is never used to create a surface.
+    struct NoSurface;
+
+    impl HasWindowHandle for NoSurface {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            // SAFETY: the handle is only stored, never dereferenced.
+            Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Web(WebWindowHandle::new(1))) })
+        }
+    }
+
+    impl HasDisplayHandle for NoSurface {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            // SAFETY: the handle is only stored, never dereferenced.
+            Ok(
+                unsafe {
+                    DisplayHandle::borrow_raw(RawDisplayHandle::Web(WebDisplayHandle::new()))
+                },
+            )
+        }
+    }
+
+    /// A primary marker an earlier command in the same flush removed from the render window is
+    /// given back by that flush's extraction.
+    #[test]
+    fn a_primary_marker_removed_earlier_in_the_same_flush_is_restored() {
+        let mut render_world = World::new();
+        let render_window = render_world.spawn(PrimaryWindow).id();
+        let mut main_world = World::new();
+        main_world.init_resource::<Messages<WindowClosing>>();
+        main_world.spawn((
+            Window::default(),
+            RawHandleWrapper::new(&WindowWrapper::new(NoSurface)).unwrap(),
+            PrimaryWindow,
+            RenderEntity::from(render_window),
+        ));
+        render_world.insert_resource(MainWorld::default());
+        **render_world.resource_mut::<MainWorld>() = main_world;
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(render_window).remove::<PrimaryWindow>();
+                },
+                extract_windows,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut render_world);
+
+        assert!(render_world
+            .entity(render_window)
+            .contains::<PrimaryWindow>());
+    }
 }
