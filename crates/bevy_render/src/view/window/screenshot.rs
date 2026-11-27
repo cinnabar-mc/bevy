@@ -21,7 +21,8 @@ use bevy_camera::{ManualTextureViewHandle, NormalizedRenderTarget, RenderTarget}
 use bevy_color::{ColorToPacked, LinearRgba, Srgba};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
-    entity::EntityHashMap, message::message_update_system, prelude::*, system::SystemState,
+    component::ComponentIdFor, entity::EntityHashMap, message::message_update_system, prelude::*,
+    system::SystemState,
 };
 use bevy_image::{Image, TextureFormatPixelInfo, ToExtents};
 use bevy_log::{error, info, warn};
@@ -252,8 +253,29 @@ pub fn save_to_disk(path: impl AsRef<Path>) -> impl FnMut(On<ScreenshotCaptured>
     }
 }
 
-fn clear_screenshots(mut commands: Commands) {
-    commands.despawn_all::<With<Captured>>();
+/// Despawns last frame's captured screenshots. The despawn checks for captured entities when it
+/// applies, after every command queued ahead of it in the same flush, so a [`Captured`] queued
+/// earlier in that flush is despawned too. With none present it skips the despawn, which builds
+/// a query each time. Captured entities hidden by any disabling component count too, so a queued
+/// re-enable still has them despawned.
+fn clear_screenshots(mut commands: Commands, captured: ComponentIdFor<Captured>) {
+    let captured = captured.get();
+    commands.queue(move |world: &mut World| {
+        // The component index lists every archetype holding `Captured`, whatever default query
+        // filters would hide.
+        let archetypes = world.archetypes();
+        let any_captured = archetypes
+            .component_index()
+            .get(&captured)
+            .is_some_and(|holding| {
+                holding
+                    .keys()
+                    .any(|&archetype| !archetypes[archetype].is_empty())
+            });
+        if any_captured {
+            world.despawn_all::<With<Captured>>();
+        }
+    });
 }
 
 pub fn trigger_screenshots(
@@ -565,9 +587,12 @@ impl SpecializedRenderPipeline for ScreenshotToScreenPipeline {
 pub(crate) type SubmitScreenshotCommandsState<'w, 's> =
     Query<'w, 's, (MainEntity, &'s ExtractedWindow)>;
 
-/// Returns whether any screenshot was prepared this frame and needs commands encoded.
+/// Returns whether any screenshot was prepared this frame and needs commands encoded; never in a
+/// render world without screenshot support.
 pub(crate) fn has_screenshot_commands(world: &World) -> bool {
-    !world.resource::<RenderScreenshotsPrepared>().is_empty()
+    world
+        .get_resource::<RenderScreenshotsPrepared>()
+        .is_some_and(|prepared| !prepared.is_empty())
 }
 
 pub(crate) fn submit_screenshot_commands(
@@ -901,5 +926,84 @@ mod recovery_tests {
             .despawn();
         world.run_system_once(extract_screenshots).unwrap();
         assert!(world.resource::<RenderScreenshotTargets>().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{entity_disabling::Disabled, schedule::Schedule};
+
+    #[test]
+    fn clearing_despawns_only_captured_screenshots() {
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(clear_screenshots);
+        let kept = world.spawn_empty().id();
+        schedule.run(&mut world);
+        assert!(world.get_entity(kept).is_ok());
+
+        let captured = world.spawn(Captured).id();
+        schedule.run(&mut world);
+        assert!(world.get_entity(captured).is_err());
+        assert!(world.get_entity(kept).is_ok());
+
+        // A disabled capture re-enabled ahead of the flush is despawned in the same frame.
+        let disabled = world.spawn((Captured, Disabled)).id();
+        let mut reenable = Schedule::default();
+        reenable.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(disabled).remove::<Disabled>();
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        reenable.run(&mut world);
+        assert!(world.get_entity(disabled).is_err());
+    }
+
+    /// A disabling component an app registers, beyond Bevy's own.
+    #[derive(Component)]
+    struct Hibernating;
+
+    #[test]
+    fn a_capture_hidden_by_an_app_disabling_component_is_despawned_once_reenabled() {
+        let mut world = World::new();
+        world.register_disabling_component::<Hibernating>();
+        let hidden = world.spawn((Captured, Hibernating)).id();
+        let mut reenable = Schedule::default();
+        reenable.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(hidden).remove::<Hibernating>();
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        reenable.run(&mut world);
+        assert!(world.get_entity(hidden).is_err());
+    }
+
+    /// A capture queued earlier in the same flush, while no captured entity exists yet, is
+    /// despawned by that flush's cleanup instead of surviving a frame.
+    #[test]
+    fn a_capture_queued_earlier_in_the_same_flush_is_despawned() {
+        let mut world = World::new();
+        let screenshot = world.spawn_empty().id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(screenshot).insert(Captured);
+                },
+                clear_screenshots,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut world);
+        assert!(world.get_entity(screenshot).is_err());
     }
 }

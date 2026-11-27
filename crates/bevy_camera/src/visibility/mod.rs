@@ -736,6 +736,27 @@ fn reset_view_visibility(mut reset_query: Query<&mut ViewVisibility, Without<NoC
     });
 }
 
+/// Entity counts up to which [`check_visibility_cpu_culling`] tests a view's entities on its own
+/// thread instead of in parallel tasks.
+const SERIAL_CULLING_MAX_ENTITIES: usize = 256;
+
+/// What [`check_visibility_cpu_culling`] reads and marks on each culled entity.
+type VisibleAabbData = (
+    Entity,
+    &'static InheritedVisibility,
+    &'static mut ViewVisibility,
+    Option<&'static VisibilityClass>,
+    Option<&'static RenderLayers>,
+    Option<&'static Aabb>,
+    Option<&'static Sphere>,
+    &'static GlobalTransform,
+    Has<NoFrustumCulling>,
+    Has<VisibilityRange>,
+);
+
+/// One culled entity's [`VisibleAabbData`].
+type VisibleAabbItem<'w, 's> = bevy_ecs::query::QueryItem<'w, 's, VisibleAabbData>;
+
 /// System updating the visibility of entities, other than those that have opted
 /// out of CPU culling, each frame.
 ///
@@ -755,21 +776,7 @@ pub fn check_visibility_cpu_culling(
         &Camera,
         Has<NoCpuCulling>,
     )>,
-    mut visible_aabb_query: Query<
-        (
-            Entity,
-            &InheritedVisibility,
-            &mut ViewVisibility,
-            Option<&VisibilityClass>,
-            Option<&RenderLayers>,
-            Option<&Aabb>,
-            Option<&Sphere>,
-            &GlobalTransform,
-            Has<NoFrustumCulling>,
-            Has<VisibilityRange>,
-        ),
-        Without<NoCpuCulling>,
-    >,
+    mut visible_aabb_query: Query<VisibleAabbData, Without<NoCpuCulling>>,
     visible_entity_ranges: Option<Res<VisibleEntityRanges>>,
 ) {
     let visible_entity_ranges = visible_entity_ranges.as_deref();
@@ -783,80 +790,90 @@ pub fn check_visibility_cpu_culling(
 
         let view_mask = maybe_view_mask.unwrap_or_default();
 
-        visible_aabb_query.par_iter_mut().for_each_init(
-            || thread_queues.borrow_local_mut(),
-            |queue, query_item| {
-                let (
-                    entity,
-                    inherited_visibility,
-                    mut view_visibility,
-                    visibility_class,
-                    maybe_entity_mask,
-                    maybe_model_aabb,
-                    maybe_model_sphere,
-                    transform,
-                    no_frustum_culling,
-                    has_visibility_range,
-                ) = query_item;
+        let cull = |queue: &mut TypeIdHashMap<Vec<Entity>>, query_item: VisibleAabbItem| {
+            let (
+                entity,
+                inherited_visibility,
+                mut view_visibility,
+                visibility_class,
+                maybe_entity_mask,
+                maybe_model_aabb,
+                maybe_model_sphere,
+                transform,
+                no_frustum_culling,
+                has_visibility_range,
+            ) = query_item;
 
-                // Skip computing visibility for entities that are configured to be hidden.
-                // ViewVisibility has already been reset in `reset_view_visibility`.
-                if !inherited_visibility.get() {
-                    return;
-                }
+            // Skip computing visibility for entities that are configured to be hidden.
+            // ViewVisibility has already been reset in `reset_view_visibility`.
+            if !inherited_visibility.get() {
+                return;
+            }
 
-                let entity_mask = maybe_entity_mask.unwrap_or_default();
-                if !view_mask.intersects(entity_mask) {
-                    return;
-                }
+            let entity_mask = maybe_entity_mask.unwrap_or_default();
+            if !view_mask.intersects(entity_mask) {
+                return;
+            }
 
-                // If outside of the visibility range, cull.
-                if has_visibility_range
-                    && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
-                        !visible_entity_ranges.entity_is_in_range_of_view(entity, view)
-                    })
-                {
-                    return;
-                }
+            // If outside of the visibility range, cull.
+            if has_visibility_range
+                && visible_entity_ranges.is_some_and(|visible_entity_ranges| {
+                    !visible_entity_ranges.entity_is_in_range_of_view(entity, view)
+                })
+            {
+                return;
+            }
 
-                // If we have an aabb or a bounding sphere, do frustum culling
-                if !no_frustum_culling && !no_cpu_culling_camera {
-                    if let Some(model_aabb) = maybe_model_aabb {
-                        let world_from_local = transform.affine();
-                        let model_sphere = Sphere {
-                            center: world_from_local.transform_point3a(model_aabb.center),
-                            radius: transform.radius_vec3a(model_aabb.half_extents),
-                        };
-                        // Do quick sphere-based frustum culling
-                        if !frustum.intersects_sphere(&model_sphere, false) {
-                            return;
-                        }
-                        // Do aabb-based frustum culling
-                        if !frustum.intersects_obb(model_aabb, &world_from_local, true, false) {
-                            return;
-                        }
-                    } else if let Some(model_sphere) = maybe_model_sphere
-                        && !frustum.intersects_sphere(model_sphere, false)
-                    {
-                        // Do sphere-based frustum culling in this case
+            // If we have an aabb or a bounding sphere, do frustum culling
+            if !no_frustum_culling && !no_cpu_culling_camera {
+                if let Some(model_aabb) = maybe_model_aabb {
+                    let world_from_local = transform.affine();
+                    let model_sphere = Sphere {
+                        center: world_from_local.transform_point3a(model_aabb.center),
+                        radius: transform.radius_vec3a(model_aabb.half_extents),
+                    };
+                    // Do quick sphere-based frustum culling
+                    if !frustum.intersects_sphere(&model_sphere, false) {
                         return;
                     }
-                }
-
-                view_visibility.set_visible();
-
-                // The visibility class may be None here because AABB gizmos can be enabled via
-                // config without a renderable component being added to the entity. This workaround
-                // allows view visibility to be set for entities without a renderable component, but
-                // still need to render gizmos.
-                if let Some(visibility_class) = visibility_class {
-                    // Add the entity to the queue for all visibility classes the entity is in.
-                    for visibility_class_id in visibility_class.iter() {
-                        queue.entry(*visibility_class_id).or_default().push(entity);
+                    // Do aabb-based frustum culling
+                    if !frustum.intersects_obb(model_aabb, &world_from_local, true, false) {
+                        return;
                     }
+                } else if let Some(model_sphere) = maybe_model_sphere
+                    && !frustum.intersects_sphere(model_sphere, false)
+                {
+                    // Do sphere-based frustum culling in this case
+                    return;
                 }
-            },
-        );
+            }
+
+            view_visibility.set_visible();
+
+            // The visibility class may be None here because AABB gizmos can be enabled via
+            // config without a renderable component being added to the entity. This workaround
+            // allows view visibility to be set for entities without a renderable component, but
+            // still need to render gizmos.
+            if let Some(visibility_class) = visibility_class {
+                // Add the entity to the queue for all visibility classes the entity is in.
+                for visibility_class_id in visibility_class.iter() {
+                    queue.entry(*visibility_class_id).or_default().push(entity);
+                }
+            }
+        };
+
+        // Opening a task scope costs more than testing a few hundred entities on this thread.
+        if visible_aabb_query.iter().len() <= SERIAL_CULLING_MAX_ENTITIES {
+            let mut queue = thread_queues.borrow_local_mut();
+            for query_item in &mut visible_aabb_query {
+                cull(&mut queue, query_item);
+            }
+        } else {
+            visible_aabb_query.par_iter_mut().for_each_init(
+                || thread_queues.borrow_local_mut(),
+                |queue, query_item| cull(queue, query_item),
+            );
+        }
 
         visible_entities.clear_all();
 
@@ -1308,6 +1325,68 @@ mod test {
         let entity_clone_visibility_class =
             world.entity(entity_clone).get::<VisibilityClass>().unwrap();
         assert_eq!(entity_clone_visibility_class.len(), 1);
+    }
+
+    /// Culls `count` entities alternately in front of and behind one camera, returning the
+    /// camera's visible list, the entities marked visible and the entities in front, each in
+    /// entity order.
+    fn cull_line_of_entities(count: usize) -> (Vec<Entity>, Vec<Entity>, Vec<Entity>) {
+        // Starts the compute task pool that parallel culling runs on.
+        App::new().add_plugins(TaskPoolPlugin::default());
+        let mut world = World::new();
+        use crate::CameraProjection;
+        let frustum =
+            crate::PerspectiveProjection::default().compute_frustum(&GlobalTransform::IDENTITY);
+        let camera = world
+            .spawn((Camera::default(), VisibleEntities::default(), frustum))
+            .id();
+        let mut in_front = Vec::new();
+        for i in 0..count {
+            let distance = 5.0 + i as f32 * 0.01;
+            let z = if i % 2 == 0 { -distance } else { distance };
+            let entity = world
+                .spawn((
+                    TestVisibilityClassHook,
+                    InheritedVisibility::VISIBLE,
+                    ViewVisibility::default(),
+                    GlobalTransform::from_xyz(0.0, 0.0, z),
+                    Aabb::from_min_max(bevy_math::Vec3::splat(-0.5), bevy_math::Vec3::splat(0.5)),
+                ))
+                .id();
+            if i % 2 == 0 {
+                in_front.push(entity);
+            }
+        }
+        let mut schedule = Schedule::default();
+        schedule.add_systems(check_visibility_cpu_culling);
+        schedule.run(&mut world);
+        let listed = world
+            .get::<VisibleEntities>(camera)
+            .unwrap()
+            .get(TypeId::of::<TestVisibilityClassHook>())
+            .to_vec();
+        let mut marked: Vec<Entity> = world
+            .query::<(Entity, &ViewVisibility)>()
+            .iter(&world)
+            .filter(|(_, visibility)| visibility.get())
+            .map(|(entity, _)| entity)
+            .collect();
+        marked.sort_unstable();
+        in_front.sort_unstable();
+        (listed, marked, in_front)
+    }
+
+    #[test]
+    fn cpu_culling_marks_and_lists_the_same_entities_serially_and_in_parallel() {
+        for count in [
+            8,
+            SERIAL_CULLING_MAX_ENTITIES,
+            SERIAL_CULLING_MAX_ENTITIES * 3,
+        ] {
+            let (listed, marked, in_front) = cull_line_of_entities(count);
+            assert_eq!(listed, in_front, "{count} entities");
+            assert_eq!(marked, in_front, "{count} entities");
+        }
     }
 
     #[test]

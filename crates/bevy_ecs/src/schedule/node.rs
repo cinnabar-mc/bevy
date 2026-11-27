@@ -105,6 +105,11 @@ impl System for SystemWithAccess {
     }
 
     #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.system.may_apply_deferred()
+    }
+
+    #[inline]
     fn queue_deferred(&mut self, world: DeferredWorld) {
         self.system.queue_deferred(world);
     }
@@ -193,6 +198,11 @@ impl System for ConditionWithAccess {
     #[inline]
     fn apply_deferred(&mut self, world: &mut World) {
         self.condition.apply_deferred(world);
+    }
+
+    #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        self.condition.may_apply_deferred()
     }
 
     #[inline]

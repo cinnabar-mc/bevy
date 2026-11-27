@@ -1,7 +1,7 @@
 use crate::diagnostic::internal::DiagnosticsRecorder;
 use crate::render_phase::TrackedRenderPass;
 use crate::render_resource::{CommandEncoder, RenderPassDescriptor};
-use crate::renderer::{wgpu_wrapper, RenderDevice};
+use crate::renderer::{wgpu_wrapper, FrameSubmission, RenderDevice, RenderFrameTail, RenderQueue};
 use alloc::borrow::Cow;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::change_detection::Tick;
@@ -24,7 +24,7 @@ use bevy_log::info_span;
 use bevy_tasks::ComputeTaskPool;
 use core::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use wgpu::CommandBuffer;
+use wgpu::{CommandBuffer, SubmissionIndex};
 
 /// Label of the command encoder shared by render systems that run serially.
 const FRAME_ENCODER_LABEL: &str = "frame_encoder";
@@ -80,23 +80,31 @@ wgpu_wrapper!(struct WgpuPendingCommandBuffersInner(PendingCommandBuffersInner))
 /// open after the pending commands. Queuing anything else closes that encoder first, so command
 /// buffers are always submitted in the order their commands were recorded.
 #[derive(Resource)]
-pub struct PendingCommandBuffers(Mutex<WgpuPendingCommandBuffersInner>);
+pub struct PendingCommandBuffers {
+    inner: Mutex<WgpuPendingCommandBuffersInner>,
+    /// Index of the latest submission made by [`Self::submit`], until
+    /// [`Self::take_submission`] takes it.
+    submission: Option<SubmissionIndex>,
+}
 
 impl Default for PendingCommandBuffers {
     fn default() -> Self {
-        Self(Mutex::new(WgpuPendingCommandBuffersInner::new(
-            PendingCommandBuffersInner::default(),
-        )))
+        Self {
+            inner: Mutex::new(WgpuPendingCommandBuffersInner::new(
+                PendingCommandBuffersInner::default(),
+            )),
+            submission: None,
+        }
     }
 }
 
 impl PendingCommandBuffers {
     fn inner(&mut self) -> &mut PendingCommandBuffersInner {
-        self.0.get_mut().unwrap_or_else(PoisonError::into_inner)
+        self.inner.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock(&self) -> MutexGuard<'_, WgpuPendingCommandBuffersInner> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn push(&mut self, buffers: impl IntoIterator<Item = CommandBuffer>) {
@@ -152,26 +160,68 @@ impl PendingCommandBuffers {
 
         let inner = self.inner();
         inner.close_frame_encoder();
-        let commands = inner.commands.drain(..);
+        let encoders = encoder_count(&inner.commands);
+        finish_commands(inner.commands.drain(..), encoders)
+    }
 
+    /// Finishes every pending encoder and submits all pending command buffers to `queue` in one
+    /// submission, keeping its index for [`Self::take_submission`]. Submits nothing when nothing
+    /// is pending.
+    pub fn submit(&mut self, queue: &RenderQueue) {
+        #[cfg(feature = "trace")]
+        let buffer_count = self.len();
+        let mut buffers = self.finish().peekable();
+        if buffers.peek().is_none() {
+            return;
+        }
+        #[cfg(feature = "trace")]
+        let _span = info_span!("queue_submit", count = buffer_count).entered();
+        let index = queue.submit(buffers);
+        self.submission = Some(index);
+    }
+
+    /// Moves every pending command buffer and encoder into `tail`, which finishes them and submits
+    /// them to `queue` in one submission after the render app is handed back. The submission's
+    /// index goes to `submission`, which also holds work that must follow it until then.
+    /// Defers nothing when nothing is pending.
+    pub fn submit_in_tail(
+        &mut self,
+        queue: &RenderQueue,
+        tail: &RenderFrameTail,
+        submission: &FrameSubmission,
+    ) {
+        let inner = self.inner();
+        inner.close_frame_encoder();
+        if inner.commands.is_empty() {
+            return;
+        }
         #[cfg(target_arch = "wasm32")]
         {
-            finish_sequential(commands)
+            let _ = (tail, submission);
+            self.submit(queue);
         }
-
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let encoders = commands
-                .as_slice()
-                .iter()
-                .filter(|command| matches!(command, PendingCommandBuffer::Encoder { .. }))
-                .count();
-            if encoders <= MAX_SEQUENTIAL_FINISHES {
-                FinishedCommandBuffers::Sequential(finish_sequential(commands))
-            } else {
-                FinishedCommandBuffers::Parallel(finish_parallel(commands))
-            }
+            let commands = core::mem::take(&mut inner.commands);
+            let queue = queue.clone();
+            let sequence = submission.begin_deferred();
+            let submission = submission.clone();
+            tail.defer(move || {
+                #[cfg(feature = "trace")]
+                let _span = info_span!("frame_tail_submit", count = commands.len()).entered();
+                let encoders = encoder_count(&commands);
+                let index = queue.submit(finish_commands(commands.into_iter(), encoders));
+                submission.finish_deferred(sequence, index);
+            });
         }
+    }
+
+    /// Takes the index of the latest submission made by [`Self::submit`] since the previous call.
+    ///
+    /// Code that bounds or waits for the GPU work of recent frames reads the frame's index here
+    /// instead of making a submission of its own to obtain one.
+    pub fn take_submission(&mut self) -> Option<SubmissionIndex> {
+        self.submission.take()
     }
 
     /// Returns whether no command buffer is pending submission.
@@ -225,6 +275,36 @@ impl PendingCommandBuffers {
 }
 
 /// Finishes pending command buffers sequentially, preserving their order.
+/// Counts the unfinished encoders among `commands`.
+fn encoder_count(commands: &[PendingCommandBuffer]) -> usize {
+    commands
+        .iter()
+        .filter(|command| matches!(command, PendingCommandBuffer::Encoder { .. }))
+        .count()
+}
+
+/// Finishes `commands`, which hold `encoders` unfinished encoders, returning their command
+/// buffers in order: sequentially for a few encoders, otherwise in parallel up front.
+fn finish_commands(
+    commands: impl Iterator<Item = PendingCommandBuffer>,
+    encoders: usize,
+) -> impl Iterator<Item = CommandBuffer> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = encoders;
+        finish_sequential(commands)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if encoders <= MAX_SEQUENTIAL_FINISHES {
+            FinishedCommandBuffers::Sequential(finish_sequential(commands))
+        } else {
+            FinishedCommandBuffers::Parallel(finish_parallel(commands))
+        }
+    }
+}
+
 fn finish_sequential(
     commands: impl Iterator<Item = PendingCommandBuffer>,
 ) -> impl Iterator<Item = CommandBuffer> {
@@ -563,16 +643,13 @@ impl Drop for RenderContext<'_, '_> {
 #[derive(SystemParam)]
 pub struct FlushCommands<'w> {
     pending: ResMut<'w, PendingCommandBuffers>,
-    queue: Res<'w, super::RenderQueue>,
+    queue: Res<'w, RenderQueue>,
 }
 
 impl<'w> FlushCommands<'w> {
     /// Flushes all pending command buffers to the render queue.
     pub fn flush(&mut self) {
-        let mut buffers = self.pending.finish().peekable();
-        if buffers.peek().is_some() {
-            self.queue.submit(buffers);
-        }
+        self.pending.submit(&self.queue);
     }
 }
 
@@ -682,6 +759,7 @@ mod tests {
     use super::*;
     use crate::renderer::RenderQueue;
     use crate::test_utils::create_dummy_device;
+    use alloc::sync::Arc;
     use bevy_ecs::schedule::Schedule;
     use bevy_tasks::TaskPool;
 
@@ -730,14 +808,12 @@ mod tests {
 
     /// Finishes and submits everything pending, returning the number of command buffers.
     fn submit(world: &mut World) -> usize {
+        let count = world.resource::<PendingCommandBuffers>().len();
         let queue = world.resource::<RenderQueue>().clone();
-        let buffers: Vec<_> = world
-            .resource_mut::<PendingCommandBuffers>()
-            .finish()
-            .collect();
-        let count = buffers.len();
-        queue.submit(buffers);
-        assert!(world.resource::<PendingCommandBuffers>().is_empty());
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        pending.submit(&queue);
+        assert!(pending.is_empty());
+        assert_eq!(pending.take_submission().is_some(), count > 0);
         count
     }
 
@@ -831,6 +907,106 @@ mod tests {
             );
             assert_eq!(submit(&mut world), expected.len());
         }
+    }
+
+    #[test]
+    fn each_submission_reports_its_index_once() {
+        let mut world = world();
+        let mut schedule = schedule(Outer, true);
+        schedule.add_systems(encode);
+        let queue = world.resource::<RenderQueue>().clone();
+        for _ in 0..2 {
+            schedule.run(&mut world);
+            let mut pending = world.resource_mut::<PendingCommandBuffers>();
+            pending.submit(&queue);
+            assert!(pending.take_submission().is_some());
+            assert!(pending.take_submission().is_none());
+        }
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        pending.submit(&queue);
+        assert!(
+            pending.take_submission().is_none(),
+            "a frame with nothing pending makes no submission"
+        );
+    }
+
+    #[test]
+    fn a_tail_submission_runs_after_the_render_schedule_with_its_waiting_work() {
+        let mut world = world();
+        let mut schedule = schedule(Outer, true);
+        schedule.add_systems((encode, add_buffer).chain());
+        schedule.run(&mut world);
+        let queue = world.resource::<RenderQueue>().clone();
+        let tail = RenderFrameTail::default();
+        let submission = FrameSubmission::default();
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit_in_tail(&queue, &tail, &submission);
+        assert!(world.resource::<PendingCommandBuffers>().is_empty());
+        let submitted = Arc::new(Mutex::new(None));
+        let observed = submitted.clone();
+        let reader = submission.clone();
+        submission.after_submit(move || {
+            *observed.lock().unwrap() = Some(reader.take_index().is_some());
+        });
+        assert!(
+            submitted.lock().unwrap().is_none(),
+            "the frame has not submitted yet"
+        );
+        assert!(world
+            .resource_mut::<PendingCommandBuffers>()
+            .take_submission()
+            .is_none());
+        tail.run();
+        assert_eq!(*submitted.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn nothing_pending_defers_no_tail_submission() {
+        let mut world = world();
+        let queue = world.resource::<RenderQueue>().clone();
+        let tail = RenderFrameTail::default();
+        let submission = FrameSubmission::default();
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit_in_tail(&queue, &tail, &submission);
+        let ran = Arc::new(Mutex::new(false));
+        let flag = ran.clone();
+        submission.after_submit(move || *flag.lock().unwrap() = true);
+        assert!(
+            *ran.lock().unwrap(),
+            "work runs at once without a deferred submission"
+        );
+        tail.run();
+        assert!(submission.take_index().is_none());
+    }
+
+    /// The queue's submission counter, read from an index's debug form.
+    fn submission_number(index: &SubmissionIndex) -> u64 {
+        format!("{index:?}")
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("submission index")
+    }
+
+    #[test]
+    fn a_later_submission_replaces_one_not_yet_taken() {
+        let mut world = world();
+        let mut schedule = schedule(Outer, true);
+        schedule.add_systems(encode);
+        let queue = world.resource::<RenderQueue>().clone();
+        // An early flush, then the graph's own submission, before anything takes the index.
+        schedule.run(&mut world);
+        world.resource_mut::<PendingCommandBuffers>().submit(&queue);
+        schedule.run(&mut world);
+        world.resource_mut::<PendingCommandBuffers>().submit(&queue);
+        let marker = queue.submit([]);
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        let taken = pending.take_submission().expect("the graph's submission");
+        assert_eq!(submission_number(&taken) + 1, submission_number(&marker));
+        assert!(pending.take_submission().is_none());
     }
 
     #[test]

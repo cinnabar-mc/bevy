@@ -434,6 +434,7 @@ impl Plugin for RenderPlugin {
             render_app.init_resource::<RenderScheduleOrder>();
             render_app.init_resource::<RenderAssetBytesPerFrameLimiter>();
             render_app.init_gpu_resource::<renderer::PendingCommandBuffers>();
+            render_app.init_resource::<renderer::FrameSubmission>();
             render_app.insert_resource(sender);
             render_app.insert_resource(asset_server);
             render_app.insert_resource(RenderState::Initializing);
@@ -477,8 +478,12 @@ impl Plugin for RenderPlugin {
                         .chain()
                         .in_set(RenderSystems::Render),
                     reset_render_asset_bytes_per_frame.in_set(RenderSystems::Cleanup),
+                    renderer::run_frame_tail
+                        .in_set(RenderSystems::PostCleanup)
+                        .run_if(not(resource_exists::<renderer::FrameTailOnRenderThread>)),
                 ),
             );
+            render_app.init_resource::<renderer::RenderFrameTail>();
         }
     }
 

@@ -22,6 +22,7 @@ struct CachedTextureMeta {
 #[derive(Clone)]
 pub struct CachedTexture {
     pub texture: Texture,
+    /// A view of the whole texture with the default descriptor, kept as long as the texture.
     pub default_view: TextureView,
 }
 
@@ -81,6 +82,16 @@ impl TextureCache {
                 }
             }
         }
+    }
+
+    /// Returns whether `texture` is one this cache handed out, with the default view it created
+    /// for it using the default [`TextureViewDescriptor`]. A [`CachedTexture`] built elsewhere can
+    /// carry any view in `default_view`.
+    pub fn created_default_view(&self, texture: &CachedTexture) -> bool {
+        self.textures.values().flatten().any(|cached| {
+            cached.texture.id() == texture.texture.id()
+                && cached.default_view.id() == texture.default_view.id()
+        })
     }
 
     /// Returns `true` if the texture cache contains no textures.

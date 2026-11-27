@@ -760,6 +760,11 @@ where
     }
 
     #[inline]
+    fn may_apply_deferred(&self) -> bool {
+        F::Param::MAY_APPLY_DEFERRED
+    }
+
+    #[inline]
     fn queue_deferred(&mut self, world: DeferredWorld) {
         let param_state = &mut self.state.as_mut().expect(Self::ERROR_UNINITIALIZED).param;
         F::Param::queue(param_state, &self.system_meta, world);

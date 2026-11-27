@@ -6,7 +6,7 @@ use crate::{
 };
 use bevy_app::{App, Plugin};
 use bevy_diagnostic::FrameCount;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{component::Mutable, prelude::*};
 use bevy_reflect::prelude::*;
 use bevy_shader::load_shader_library;
 use bevy_time::Time;
@@ -30,11 +30,29 @@ impl Plugin for GlobalsPlugin {
 }
 
 fn extract_frame_count(mut commands: Commands, frame_count: Extract<Res<FrameCount>>) {
-    commands.insert_resource(**frame_count);
+    commands.queue(write_resource(**frame_count));
 }
 
+/// Copies the main world's [`Time`] into the render world when the extraction commands apply.
 fn extract_time(mut commands: Commands, time: Extract<Res<Time>>) {
-    commands.insert_resource(**time);
+    commands.queue(write_resource(**time));
+}
+
+/// Stores `value` as the render world's `R`. Once the render world has one, it is assigned in
+/// place: the same value, marked changed at the same tick as a reinsertion, without reinserting
+/// the resource. While a reinsertion would run an insert or discard hook or observer, checked on
+/// every write so observers added later see each one, the resource is reinserted instead.
+fn write_resource<R: Resource<Mutability = Mutable>>(value: R) -> impl FnOnce(&mut World) {
+    move |world: &mut World| {
+        let in_place = world.resource_entity::<R>().is_some_and(|entity| {
+            !crate::camera::insert_runs_lifecycle_callbacks(world.entity(entity).archetype())
+        });
+        if in_place {
+            *world.resource_mut::<R>() = value;
+        } else {
+            world.insert_resource(value);
+        }
+    }
 }
 
 /// Contains global values useful when writing shaders.
@@ -77,4 +95,63 @@ fn prepare_globals_buffer(
     globals_buffer
         .buffer
         .write_buffer(&render_device, &render_queue);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{change_detection::DetectChanges, world::CommandQueue};
+    use core::time::Duration;
+
+    #[test]
+    fn a_resource_written_in_place_matches_a_reinsertion() {
+        let ticked = |seconds| {
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs(seconds));
+            time
+        };
+        let mut assigned = World::new();
+        let mut reinserted = World::new();
+        write_resource(ticked(1))(&mut assigned);
+        reinserted.insert_resource(ticked(1));
+        for world in [&mut assigned, &mut reinserted] {
+            world.increment_change_tick();
+        }
+
+        let mut queue = CommandQueue::default();
+        queue.push(write_resource(ticked(2)));
+        queue.apply(&mut assigned);
+        reinserted.insert_resource(ticked(2));
+
+        let state = |world: &World| {
+            let time = world.resource_ref::<Time>();
+            (time.elapsed(), time.added(), time.last_changed())
+        };
+        assert_eq!(state(&assigned), state(&reinserted));
+        assert_eq!(state(&assigned).0, Duration::from_secs(2));
+    }
+
+    #[derive(Resource, Default)]
+    struct Inserts(usize);
+
+    /// An observer of the resource's insertion, added after writes started assigning in place,
+    /// sees the next write.
+    #[test]
+    fn an_insert_observer_added_later_sees_the_next_resource_write() {
+        use bevy_ecs::{lifecycle::Insert, observer::On};
+
+        let mut world = World::new();
+        world.init_resource::<Inserts>();
+        write_resource(FrameCount(1))(&mut world);
+        write_resource(FrameCount(2))(&mut world);
+        world.add_observer(|_: On<Insert<FrameCount>>, mut inserts: ResMut<Inserts>| {
+            inserts.0 += 1;
+        });
+
+        write_resource(FrameCount(3))(&mut world);
+        write_resource(FrameCount(4))(&mut world);
+
+        assert_eq!(world.resource::<Inserts>().0, 2);
+        assert_eq!(world.resource::<FrameCount>().0, 4);
+    }
 }

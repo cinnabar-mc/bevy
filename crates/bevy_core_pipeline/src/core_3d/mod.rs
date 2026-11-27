@@ -719,14 +719,17 @@ pub fn prepare_core_3d_depth_textures(
             })
             .clone();
 
-        commands.entity(entity).insert(ViewDepthStencilTexture::new(
-            cached_texture,
-            match camera_3d.depth_load_op {
-                Camera3dDepthLoadOp::Clear(v) => Some(v),
-                Camera3dDepthLoadOp::Load => None,
-            },
-            None,
-        ));
+        commands
+            .entity(entity)
+            .insert(ViewDepthStencilTexture::from_texture_cache(
+                cached_texture,
+                match camera_3d.depth_load_op {
+                    Camera3dDepthLoadOp::Clear(v) => Some(v),
+                    Camera3dDepthLoadOp::Load => None,
+                },
+                None,
+                &texture_cache,
+            ));
     }
 }
 
@@ -990,6 +993,7 @@ pub fn prepare_prepass_textures(
                 cached_depth_texture1,
                 cached_depth_texture2,
                 frame_count.0,
+                &texture_cache,
             ),
             normal: cached_normals_texture
                 .map(|t| ColorAttachment::new(t, None, None, Some(LinearRgba::BLACK.into()))),
@@ -1042,13 +1046,68 @@ fn package_double_buffered_depth_texture(
     texture1: Option<CachedTexture>,
     texture2: Option<CachedTexture>,
     frame_count: u32,
+    cache: &TextureCache,
 ) -> Option<DepthStencilAttachment> {
+    let attachment = |current, previous| {
+        DepthStencilAttachment::from_texture_cache(current, previous, Some(0.0), None, cache)
+    };
     match (texture1, texture2) {
-        (Some(t1), None) => Some(DepthStencilAttachment::new(t1, None, Some(0.0), None)),
-        (Some(t1), Some(t2)) if frame_count.is_multiple_of(2) => {
-            Some(DepthStencilAttachment::new(t1, Some(t2), Some(0.0), None))
-        }
-        (Some(t1), Some(t2)) => Some(DepthStencilAttachment::new(t2, Some(t1), Some(0.0), None)),
+        (Some(t1), None) => Some(attachment(t1, None)),
+        (Some(t1), Some(t2)) if frame_count.is_multiple_of(2) => Some(attachment(t1, Some(t2))),
+        (Some(t1), Some(t2)) => Some(attachment(t2, Some(t1))),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::{entity_disabling::Disabled, schedule::Schedule};
+    use bevy_render::{batching::gpu_preprocessing::GpuPreprocessingMode, MainWorld};
+
+    /// A render world whose main world holds one active 3D camera without prepasses, synced to a
+    /// render camera spawned with `render`.
+    fn worlds(render: impl Bundle) -> (World, Entity) {
+        let mut render_world = World::new();
+        let render_camera = render_world.spawn(render).id();
+        let mut main_world = World::new();
+        main_world.spawn((Camera3d::default(), RenderEntity::from(render_camera)));
+        let mut extracted = MainWorld::default();
+        *extracted = main_world;
+        render_world.insert_resource(extracted);
+        render_world.init_resource::<ViewBinnedRenderPhases<Opaque3dPrepass>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<AlphaMask3dPrepass>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<Opaque3dDeferred>>();
+        render_world.init_resource::<ViewBinnedRenderPhases<AlphaMask3dDeferred>>();
+        render_world.insert_resource(GpuPreprocessingSupport {
+            max_supported_mode: GpuPreprocessingMode::None,
+        });
+        (render_world, render_camera)
+    }
+
+    #[test]
+    fn prepass_markers_are_removed_from_a_disabled_render_camera() {
+        let (mut world, camera) = worlds((DepthPrepass, Disabled));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(extract_camera_prepass_phase);
+        schedule.run(&mut world);
+        assert!(!world.entity(camera).contains::<DepthPrepass>());
+    }
+
+    #[test]
+    fn prepass_markers_queued_earlier_in_extraction_are_removed() {
+        let (mut world, camera) = worlds(());
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                move |mut commands: Commands| {
+                    commands.entity(camera).insert(DepthPrepass);
+                },
+                extract_camera_prepass_phase,
+            )
+                .chain_ignore_deferred(),
+        );
+        schedule.run(&mut world);
+        assert!(!world.entity(camera).contains::<DepthPrepass>());
     }
 }

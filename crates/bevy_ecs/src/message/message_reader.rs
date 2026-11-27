@@ -158,6 +158,7 @@ impl<'w, 's, M: Message> core::ops::DerefMut for PopulatedMessageReader<'w, 's, 
 unsafe impl<'w, 's, M: Message> SystemParam for PopulatedMessageReader<'w, 's, M> {
     type State = <MessageReader<'w, 's, M> as SystemParam>::State;
     type Item<'world, 'state> = PopulatedMessageReader<'world, 'state, M>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut crate::prelude::World) -> Self::State {
         MessageReader::<M>::init_state(world)

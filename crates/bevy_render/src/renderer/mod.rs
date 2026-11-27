@@ -1,9 +1,13 @@
+mod frame_submission;
+mod frame_tail;
 #[cfg(feature = "raw_vulkan_init")]
 pub mod raw_vulkan_init;
 mod render_context;
 mod render_device;
 mod wgpu_wrapper;
 
+pub use frame_submission::{frame_tail_submission, FrameSubmission, SubmitInFrameTail};
+pub use frame_tail::{run_frame_tail, FrameTailOnRenderThread, RenderFrameTail};
 pub use render_context::{
     run_render_schedule, CurrentView, FlushCommands, PendingCommandBuffers, RenderContext,
     RenderContextState, SerialRenderExecutor, ViewQuery,
@@ -105,13 +109,25 @@ pub fn render_system(
     // before presentation.
     if !world.resource::<PendingCommandBuffers>().is_empty() {
         let render_queue = world.resource::<RenderQueue>().clone();
-        render_queue.submit(world.resource_mut::<PendingCommandBuffers>().finish());
+        let tail_submission = frame_tail_submission(world);
+        let mut pending = world.resource_mut::<PendingCommandBuffers>();
+        match tail_submission {
+            Some((tail, submission)) => pending.submit_in_tail(&render_queue, &tail, &submission),
+            None => pending.submit(&render_queue),
+        }
     }
 
     {
         #[cfg(feature = "trace")]
         let _span = info_span!("present_frames").entered();
 
+        // A render thread that runs the frame tail presents after handing the render app back, so
+        // the next extraction does not wait for presentation; the next frame acquires its swap
+        // chain textures on that thread after the tail.
+        let tail = world
+            .contains_resource::<FrameTailOnRenderThread>()
+            .then(|| world.get_resource::<RenderFrameTail>().cloned())
+            .flatten();
         if let Ok((views, mut windows, render_queue)) = present_state.get_mut(world) {
             for (window_entity, mut window) in &mut windows {
                 let view_needs_present = views.iter().any(|(view_target, camera)| {
@@ -122,7 +138,13 @@ pub fn render_system(
                 });
 
                 if view_needs_present || window.needs_initial_present {
-                    window.present(&render_queue);
+                    match &tail {
+                        Some(tail) => window.present_with(|frame| {
+                            let queue = render_queue.clone();
+                            tail.defer(move || frame.present(&queue));
+                        }),
+                        None => window.present(&render_queue),
+                    }
                 }
             }
         }

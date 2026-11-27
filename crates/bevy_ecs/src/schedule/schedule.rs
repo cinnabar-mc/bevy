@@ -49,14 +49,22 @@ use Direction::{Incoming, Outgoing};
 /// Resource that stores [`Schedule`]s mapped to [`ScheduleLabel`]s excluding the current running [`Schedule`].
 #[derive(Default, Resource)]
 pub struct Schedules {
-    inner: HashMap<InternedScheduleLabel, Schedule>,
+    /// Each label's slot: its schedule, unless it is absent, and whether it was removed to execute
+    /// in [`World::try_schedule_scope`]. Keeping both in one entry makes taking a schedule out and
+    /// putting it back one lookup each.
+    inner: HashMap<InternedScheduleLabel, ScheduleSlot>,
     /// List of [`ComponentId`]s to ignore when reporting system order ambiguity conflicts
     pub ignored_scheduling_ambiguities: BTreeSet<ComponentId>,
-    /// Set of schedule labels that have been removed to execute in [`World::try_schedule_scope`].
-    temporarily_removed: HashSet<InternedScheduleLabel>,
     /// Set of schedule labels that have attempted to be read in [`World::try_schedule_scope`],
     /// but have no associated [`Schedule`] in `inner`
     empty_labels: HashSet<InternedScheduleLabel>,
+}
+
+/// One label's entry in [`Schedules`]. A slot without a schedule exists only while it is
+/// temporarily removed.
+struct ScheduleSlot {
+    schedule: Option<Schedule>,
+    temporarily_removed: bool,
 }
 
 impl Schedules {
@@ -70,9 +78,7 @@ impl Schedules {
     /// If the map already had an entry for `label`, `schedule` is inserted,
     /// and the old schedule is returned. Otherwise, `None` is returned.
     pub fn insert(&mut self, schedule: Schedule) -> Option<Schedule> {
-        self.temporarily_removed.remove(&schedule.label);
-        // error if above is true
-        self.inner.insert(schedule.label, schedule)
+        self.put(schedule)
     }
 
     /// Inserts a labeled schedule into the map.
@@ -80,28 +86,51 @@ impl Schedules {
     /// If the map already had an entry for `label`, `schedule` is inserted,
     /// and the old schedule is returned. Otherwise, `None` is returned.
     pub fn reinsert(&mut self, schedule: Schedule) -> Option<Schedule> {
-        self.temporarily_removed.remove(&schedule.label);
-        // error if above false
-        self.inner.insert(schedule.label, schedule)
+        self.put(schedule)
+    }
+
+    /// Stores `schedule` under its label, clearing its temporarily-removed mark, and returns the
+    /// schedule it replaced.
+    fn put(&mut self, schedule: Schedule) -> Option<Schedule> {
+        match self.inner.get_mut(&schedule.label) {
+            Some(slot) => {
+                slot.temporarily_removed = false;
+                slot.schedule.replace(schedule)
+            }
+            None => {
+                self.inner.insert(
+                    schedule.label,
+                    ScheduleSlot {
+                        schedule: Some(schedule),
+                        temporarily_removed: false,
+                    },
+                );
+                None
+            }
+        }
     }
 
     /// Removes the schedule corresponding to the `label` from the map, returning it if it existed.
     pub fn remove(&mut self, label: impl ScheduleLabel) -> Option<Schedule> {
-        self.inner.remove(&label.intern())
+        self.remove_entry(label).map(|(_, schedule)| schedule)
     }
 
     /// Removes the schedule corresponding to the `label` from the map, returning it if it existed, tracks.
     pub fn remove_temporarily(&mut self, label: impl ScheduleLabel) -> Option<Schedule> {
         let label = label.intern();
-        let k = self.inner.remove(&label);
-        if k.is_some() {
-            self.temporarily_removed.insert(label);
-            // error if above false
-            self.empty_labels.remove(&label);
+        let schedule = self.inner.get_mut(&label).and_then(|slot| {
+            let schedule = slot.schedule.take()?;
+            slot.temporarily_removed = true;
+            Some(schedule)
+        });
+        if schedule.is_some() {
+            if !self.empty_labels.is_empty() {
+                self.empty_labels.remove(&label);
+            }
         } else {
             self.empty_labels.insert(label);
         }
-        k
+        schedule
     }
 
     /// Removes the (schedule, label) pair corresponding to the `label` from the map, returning it if it existed.
@@ -109,12 +138,26 @@ impl Schedules {
         &mut self,
         label: impl ScheduleLabel,
     ) -> Option<(InternedScheduleLabel, Schedule)> {
-        self.inner.remove_entry(&label.intern())
+        let label = label.intern();
+        let slot = self.inner.get_mut(&label)?;
+        let schedule = slot.schedule.take()?;
+        // A temporarily removed label stays marked until its schedule is put back.
+        if slot.temporarily_removed {
+            Some((label, schedule))
+        } else {
+            self.inner
+                .remove_entry(&label)
+                .map(|(label, _)| (label, schedule))
+        }
     }
 
     /// Gets a set of temporarily removed schedules
     pub fn get_temporarily_removed(&self) -> HashSet<InternedScheduleLabel> {
-        self.temporarily_removed.clone()
+        self.inner
+            .iter()
+            .filter(|(_, slot)| slot.temporarily_removed)
+            .map(|(label, _)| *label)
+            .collect()
     }
 
     /// Gets a set of empty schedule labels
@@ -124,37 +167,43 @@ impl Schedules {
 
     /// Does a schedule with the provided label already exist?
     pub fn contains(&self, label: impl ScheduleLabel) -> bool {
-        self.inner.contains_key(&label.intern())
+        self.get(label).is_some()
     }
 
     /// Returns a reference to the schedule associated with `label`, if it exists.
     pub fn get(&self, label: impl ScheduleLabel) -> Option<&Schedule> {
-        self.inner.get(&label.intern())
+        self.inner.get(&label.intern())?.schedule.as_ref()
     }
 
     /// Returns a mutable reference to the schedule associated with `label`, if it exists.
     pub fn get_mut(&mut self, label: impl ScheduleLabel) -> Option<&mut Schedule> {
-        self.inner.get_mut(&label.intern())
+        self.inner.get_mut(&label.intern())?.schedule.as_mut()
     }
 
     /// Returns a mutable reference to the schedules associated with `label`, creating one if it doesn't already exist.
     pub fn entry(&mut self, label: impl ScheduleLabel) -> &mut Schedule {
+        let label = label.intern();
         self.inner
-            .entry(label.intern())
-            .or_insert_with(|| Schedule::new(label))
+            .entry(label)
+            .or_insert_with(|| ScheduleSlot {
+                schedule: None,
+                temporarily_removed: false,
+            })
+            .schedule
+            .get_or_insert_with(|| Schedule::new(label))
     }
 
     /// Returns an iterator over all schedules. Iteration order is undefined.
     pub fn iter(&self) -> impl Iterator<Item = (&dyn ScheduleLabel, &Schedule)> {
         self.inner
             .iter()
-            .map(|(label, schedule)| (&**label, schedule))
+            .filter_map(|(label, slot)| Some((&**label, slot.schedule.as_ref()?)))
     }
     /// Returns an iterator over mutable references to all schedules. Iteration order is undefined.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&dyn ScheduleLabel, &mut Schedule)> {
         self.inner
             .iter_mut()
-            .map(|(label, schedule)| (&**label, schedule))
+            .filter_map(|(label, slot)| Some((&**label, slot.schedule.as_mut()?)))
     }
 
     /// Iterates the change ticks of all systems in all stored schedules and clamps any older than
@@ -170,7 +219,11 @@ impl Schedules {
                 reason = "The `label` variable goes unused if the `trace` feature isn't active"
             )
         )]
-        for (label, schedule) in &mut self.inner {
+        for (label, schedule) in self
+            .inner
+            .iter_mut()
+            .filter_map(|(label, slot)| Some((label, slot.schedule.as_mut()?)))
+        {
             #[cfg(feature = "trace")]
             let name = format!("{label:?}");
             #[cfg(feature = "trace")]
@@ -184,7 +237,7 @@ impl Schedules {
     /// This mutates all currently present schedules, but does not apply to schedules added
     /// in the future.
     pub fn configure_schedules(&mut self, schedule_build_settings: ScheduleBuildSettings) {
-        for (_, schedule) in &mut self.inner {
+        for (_, schedule) in self.iter_mut() {
             schedule.set_build_settings(schedule_build_settings.clone());
         }
     }
@@ -392,8 +445,10 @@ impl Chain {
 /// ```
 pub struct Schedule {
     label: InternedScheduleLabel,
-    graph: ScheduleGraph,
-    executable: SystemSchedule,
+    // The graph and executable are boxed so that a `Schedule` stays a few words: running a
+    // schedule from `Schedules` moves it out of the map and back in every time.
+    graph: Box<ScheduleGraph>,
+    executable: Box<SystemSchedule>,
     executor: Box<dyn SystemExecutor>,
     executor_initialized: bool,
 }
@@ -416,8 +471,8 @@ impl Schedule {
     pub fn new(label: impl ScheduleLabel) -> Self {
         let mut this = Self {
             label: label.intern(),
-            graph: ScheduleGraph::new(),
-            executable: SystemSchedule::new(),
+            graph: Box::new(ScheduleGraph::new()),
+            executable: Box::new(SystemSchedule::new()),
             executor: default_executor(),
             executor_initialized: false,
         };
@@ -1993,6 +2048,69 @@ pub struct ScheduleNotInitialized;
 
 #[cfg(test)]
 mod tests {
+    mod schedules_map {
+        use crate::schedule::{Schedule, ScheduleLabel, Schedules};
+
+        #[derive(ScheduleLabel, Hash, Debug, Clone, PartialEq, Eq)]
+        struct A;
+        #[derive(ScheduleLabel, Hash, Debug, Clone, PartialEq, Eq)]
+        struct B;
+
+        fn removed(schedules: &Schedules) -> usize {
+            schedules.get_temporarily_removed().len()
+        }
+
+        #[test]
+        fn a_scoped_schedule_is_hidden_until_it_is_put_back() {
+            let mut schedules = Schedules::new();
+            schedules.insert(Schedule::new(A));
+            schedules.insert(Schedule::new(B));
+            let taken = schedules.remove_temporarily(A).unwrap();
+            assert!(!schedules.contains(A) && schedules.get(A).is_none());
+            assert_eq!(schedules.iter().count(), 1);
+            assert!(schedules.get_temporarily_removed().contains(&A.intern()));
+            assert!(schedules.remove_temporarily(A).is_none());
+            assert!(schedules.get_empty_labels().contains(&A.intern()));
+            assert!(schedules.reinsert(taken).is_none());
+            assert!(schedules.contains(A));
+            assert_eq!(removed(&schedules), 0);
+            assert_eq!(schedules.iter().count(), 2);
+            // A label that becomes runnable again leaves the empty set when it is next taken.
+            let taken = schedules.remove_temporarily(A).unwrap();
+            assert!(!schedules.get_empty_labels().contains(&A.intern()));
+            schedules.reinsert(taken);
+        }
+
+        #[test]
+        fn edits_during_a_scope_keep_the_previous_bookkeeping() {
+            let mut schedules = Schedules::new();
+            schedules.insert(Schedule::new(A));
+
+            // `entry` creates a schedule but leaves the label marked; the put-back replaces it.
+            let taken = schedules.remove_temporarily(A).unwrap();
+            schedules.entry(A);
+            assert!(schedules.contains(A));
+            assert_eq!(removed(&schedules), 1);
+            // Removing it again keeps the mark, as the label was still being executed.
+            assert!(schedules.remove(A).is_some());
+            assert_eq!(removed(&schedules), 1);
+            assert!(schedules.reinsert(taken).is_none());
+            assert_eq!(removed(&schedules), 0);
+
+            // `insert` clears the mark and the put-back reports the overwritten schedule.
+            let taken = schedules.remove_temporarily(A).unwrap();
+            assert!(schedules.insert(Schedule::new(A)).is_none());
+            assert_eq!(removed(&schedules), 0);
+            assert!(schedules.reinsert(taken).is_some());
+
+            // Removing a label outside a scope drops it entirely.
+            assert!(schedules.remove_entry(A).is_some());
+            assert!(!schedules.contains(A));
+            assert_eq!(schedules.iter().count(), 0);
+            assert_eq!(removed(&schedules), 0);
+        }
+    }
+
     use alloc::{vec, vec::Vec};
     use core::any::TypeId;
 
@@ -2017,6 +2135,16 @@ mod tests {
 
     #[derive(Resource)]
     struct Resource2;
+
+    #[test]
+    fn schedule_stays_small_enough_to_move_cheaply() {
+        // `World::schedule_scope` moves the schedule out of `Schedules` and back on every run.
+        assert!(
+            size_of::<Schedule>() <= size_of::<[usize; 8]>(),
+            "Schedule grew to {} bytes",
+            size_of::<Schedule>()
+        );
+    }
 
     #[test]
     fn unchanged_auto_insert_apply_deferred_has_no_effect() {

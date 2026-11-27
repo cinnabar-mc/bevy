@@ -16,7 +16,10 @@ use crate::{
     },
     resource::{Resource, ResourceEntities, IS_RESOURCE},
     system::{Query, Single, SystemAccess, SystemMeta, SystemState},
-    world::{unsafe_world_cell::UnsafeWorldCell, DeferredWorld, FromWorld, World},
+    world::{
+        unsafe_world_cell::{ResourcePointerCache, UnsafeWorldCell},
+        DeferredWorld, FromWorld, World,
+    },
 };
 
 #[expect(deprecated, reason = "`FilteredResources` will be removed.")]
@@ -226,6 +229,15 @@ pub unsafe trait SystemParam: Sized {
     /// You could think of [`SystemParam::Item<'w, 's>`] as being an *operation* that changes the lifetimes bound to `Self`.
     type Item<'world, 'state>: SystemParam<State = Self::State>;
 
+    /// Whether [`apply`](SystemParam::apply) can change the world.
+    ///
+    /// Executors skip applying systems whose parameters all report `false`. An implementation may
+    /// set it to `false` only when its `apply` does nothing, or only forwards to parameters that
+    /// report `false`. The default, `true`, is always correct. Unlike
+    /// [`SystemMeta::set_has_deferred`], which places automatic sync points, this is a property of
+    /// the type and cannot change while a system runs.
+    const MAY_APPLY_DEFERRED: bool = true;
+
     /// Creates a new instance of this param's [`State`](SystemParam::State).
     fn init_state(world: &mut World) -> Self::State;
 
@@ -308,6 +320,7 @@ unsafe impl<'w, 's, D: ReadOnlyQueryData + 'static, F: QueryFilter + 'static> Re
 unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Query<'_, '_, D, F> {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Query<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         // SAFETY: `SystemParam::init_access` calls `QueryState::init_access`,
@@ -348,6 +361,7 @@ unsafe impl<'a, 'b, D: IterQueryData + 'static, F: QueryFilter + 'static> System
 {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Single<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         Query::init_state(world)
@@ -401,6 +415,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
 {
     type State = QueryState<D, F>;
     type Item<'w, 's> = Populated<'w, 's, D, F>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         Query::init_state(world)
@@ -575,6 +590,7 @@ macro_rules! impl_param_set {
         {
             type State = ($($param::State,)*);
             type Item<'w, 's> = ParamSet<'w, 's, ($($param,)*)>;
+            const MAY_APPLY_DEFERRED: bool = false $(|| $param::MAY_APPLY_DEFERRED)*;
 
             #[expect(
                 clippy::allow_attributes,
@@ -669,27 +685,49 @@ macro_rules! impl_param_set {
 
 all_tuples_enumerated!(impl_param_set, 1, 8, P, p);
 
+/// The [`SystemParam::State`] of [`Res`] and [`ResMut`]: the resource's id and the pointers of
+/// its last fetch, which are reused while the resource's storage is unchanged.
+pub struct ResourceParamState {
+    component_id: ComponentId,
+    pointers: ResourcePointerCache,
+}
+
+impl ResourceParamState {
+    fn new(component_id: ComponentId) -> Self {
+        Self {
+            component_id,
+            pointers: ResourcePointerCache::default(),
+        }
+    }
+
+    /// The [`ComponentId`] of the resource.
+    pub fn component_id(&self) -> ComponentId {
+        self.component_id
+    }
+}
+
 // SAFETY: Res only reads a single World resource
 unsafe impl<'a, T: Resource> ReadOnlySystemParam for Res<'a, T> {}
 
 // SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
 // conflicts with any prior access, a panic will occur.
 unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
-    type State = ComponentId;
+    type State = ResourceParamState;
     type Item<'w, 's> = Res<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
-        world.components_registrator().register_component::<T>()
+        ResourceParamState::new(world.components_registrator().register_component::<T>())
     }
 
     fn init_access(
-        &component_id: &Self::State,
+        state: &Self::State,
         system_meta: &mut SystemMeta,
         system_access: &mut SystemAccess,
         world: &mut World,
     ) {
         let mut filter = FilteredAccess::default();
-        filter.add_read(component_id);
+        filter.add_read(state.component_id);
         filter.and_with(IS_RESOURCE);
 
         if let Err(conflicts) = system_access.try_add(filter) {
@@ -704,14 +742,16 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
 
     #[inline]
     unsafe fn get_param<'w, 's>(
-        &mut component_id: &'s mut Self::State,
+        state: &'s mut Self::State,
         system_meta: &SystemMeta,
         world: UnsafeWorldCell<'w>,
         change_tick: Tick,
     ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
-        let (ptr, ticks) = world.get_resource_with_ticks(component_id).ok_or_else(|| {
-            SystemParamValidationError::invalid::<Self>("Resource does not exist")
-        })?;
+        let (ptr, ticks) = world
+            .get_resource_with_ticks_cached(state.component_id, &mut state.pointers)
+            .ok_or_else(|| {
+                SystemParamValidationError::invalid::<Self>("Resource does not exist")
+            })?;
         Ok(Res {
             value: ptr.deref(),
             ticks: ComponentTicksRef {
@@ -728,21 +768,22 @@ unsafe impl<'a, T: Resource> SystemParam for Res<'a, T> {
 // SAFETY: Res ComponentId access is applied to SystemMeta. If this Res
 // conflicts with any prior access, a panic will occur.
 unsafe impl<'a, T: Resource<Mutability = Mutable>> SystemParam for ResMut<'a, T> {
-    type State = ComponentId;
+    type State = ResourceParamState;
     type Item<'w, 's> = ResMut<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
-        world.components_registrator().register_component::<T>()
+        ResourceParamState::new(world.components_registrator().register_component::<T>())
     }
 
     fn init_access(
-        &component_id: &Self::State,
+        state: &Self::State,
         system_meta: &mut SystemMeta,
         system_access: &mut SystemAccess,
         world: &mut World,
     ) {
         let mut filter = FilteredAccess::default();
-        filter.add_write(component_id);
+        filter.add_write(state.component_id);
         filter.and_with(IS_RESOURCE);
 
         if let Err(conflicts) = system_access.try_add(filter) {
@@ -757,20 +798,23 @@ unsafe impl<'a, T: Resource<Mutability = Mutable>> SystemParam for ResMut<'a, T>
 
     #[inline]
     unsafe fn get_param<'w, 's>(
-        &mut component_id: &'s mut Self::State,
+        state: &'s mut Self::State,
         system_meta: &SystemMeta,
         world: UnsafeWorldCell<'w>,
         change_tick: Tick,
     ) -> Result<Self::Item<'w, 's>, SystemParamValidationError> {
-        let value = world.get_resource_mut_by_id(component_id).ok_or_else(|| {
-            SystemParamValidationError::invalid::<Self>("Resource does not exist")
-        })?;
+        world.assert_allows_mutable_access();
+        let (ptr, ticks) = world
+            .get_resource_with_ticks_cached(state.component_id, &mut state.pointers)
+            .ok_or_else(|| {
+                SystemParamValidationError::invalid::<Self>("Resource does not exist")
+            })?;
         Ok(ResMut {
-            value: value.value.deref_mut::<T>(),
+            value: ptr.assert_unique().deref_mut::<T>(),
             ticks: ComponentTicksMut {
-                added: value.ticks.added,
-                changed: value.ticks.changed,
-                changed_by: value.ticks.changed_by,
+                added: ticks.added.deref_mut(),
+                changed: ticks.changed.deref_mut(),
+                changed_by: ticks.changed_by.map(|changed_by| changed_by.deref_mut()),
                 last_run: system_meta.last_run,
                 this_run: change_tick,
                 summary_tick: None,
@@ -786,6 +830,7 @@ unsafe impl<'w> ReadOnlySystemParam for &'w World {}
 unsafe impl SystemParam for &'_ World {
     type State = ();
     type Item<'w, 's> = &'w World;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -822,6 +867,7 @@ unsafe impl SystemParam for &'_ World {
 unsafe impl SystemParam for &'_ mut World {
     type State = ();
     type Item<'world, 'state> = &'world mut World;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -853,6 +899,7 @@ unsafe impl SystemParam for &'_ mut World {
 unsafe impl<'w> SystemParam for DeferredWorld<'w> {
     type State = ();
     type Item<'world, 'state> = DeferredWorld<'world>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1050,6 +1097,7 @@ where
 unsafe impl<'a, T: FromWorld + Send + 'static> SystemParam for Local<'a, T> {
     type State = SyncCell<T>;
     type Item<'w, 's> = Local<'s, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         SyncCell::new(T::from_world(world))
@@ -1285,6 +1333,7 @@ pub struct NonSendMarker(PhantomData<*mut ()>);
 unsafe impl SystemParam for NonSendMarker {
     type State = ();
     type Item<'w, 's> = Self;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     #[inline]
     fn init_state(_world: &mut World) -> Self::State {}
@@ -1320,6 +1369,7 @@ unsafe impl<'w, T> ReadOnlySystemParam for NonSend<'w, T> {}
 unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = NonSend<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_non_send::<T>()
@@ -1366,6 +1416,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
 unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
     type State = ComponentId;
     type Item<'w, 's> = NonSendMut<'w, T>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         world.components_registrator().register_non_send::<T>()
@@ -1414,6 +1465,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Archetypes {}
 unsafe impl<'a> SystemParam for &'a Archetypes {
     type State = ();
     type Item<'w, 's> = &'w Archetypes;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1444,6 +1496,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a ResourceEntities {}
 unsafe impl<'a> SystemParam for &'a ResourceEntities {
     type State = ();
     type Item<'w, 's> = &'w ResourceEntities;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1474,6 +1527,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Components {}
 unsafe impl<'a> SystemParam for &'a Components {
     type State = ();
     type Item<'w, 's> = &'w Components;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1504,6 +1558,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Entities {}
 unsafe impl<'a> SystemParam for &'a Entities {
     type State = ();
     type Item<'w, 's> = &'w Entities;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1534,6 +1589,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a EntityAllocator {}
 unsafe impl<'a> SystemParam for &'a EntityAllocator {
     type State = ();
     type Item<'w, 's> = &'w EntityAllocator;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1564,6 +1620,7 @@ unsafe impl<'a> ReadOnlySystemParam for &'a Bundles {}
 unsafe impl<'a> SystemParam for &'a Bundles {
     type State = ();
     type Item<'w, 's> = &'w Bundles;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1623,6 +1680,7 @@ unsafe impl ReadOnlySystemParam for SystemChangeTick {}
 unsafe impl SystemParam for SystemChangeTick {
     type State = ();
     type Item<'w, 's> = SystemChangeTick;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -1653,6 +1711,7 @@ unsafe impl<T: SystemParam> SystemParam for Option<T> {
     type State = T::State;
 
     type Item<'world, 'state> = Option<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1695,6 +1754,7 @@ unsafe impl<T: SystemParam> SystemParam for Result<T, SystemParamValidationError
     type State = T::State;
 
     type Item<'world, 'state> = Result<T::Item<'world, 'state>, SystemParamValidationError>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1790,6 +1850,7 @@ unsafe impl<T: SystemParam> SystemParam for If<T> {
     type State = T::State;
 
     type Item<'world, 'state> = If<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         T::init_state(world)
@@ -1838,6 +1899,7 @@ unsafe impl<T: SystemParam> SystemParam for Vec<T> {
     type State = Vec<T::State>;
 
     type Item<'world, 'state> = Vec<T::Item<'world, 'state>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         Vec::new()
@@ -1890,6 +1952,7 @@ unsafe impl<T: SystemParam> SystemParam for ParamSet<'_, '_, Vec<T>> {
     type State = Vec<T::State>;
 
     type Item<'world, 'state> = ParamSet<'world, 'state, Vec<T>>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         Vec::new()
@@ -1993,6 +2056,7 @@ unsafe impl<T: SystemParam, const N: usize> SystemParam for SmallVec<[T; N]> {
     type State = SmallVec<[T::State; N]>;
 
     type Item<'world, 'state> = SmallVec<[T::Item<'world, 'state>; N]>;
+    const MAY_APPLY_DEFERRED: bool = T::MAY_APPLY_DEFERRED;
 
     fn init_state(_world: &mut World) -> Self::State {
         SmallVec::new()
@@ -2062,6 +2126,7 @@ macro_rules! impl_system_param_tuple {
         unsafe impl<$($param: SystemParam),*> SystemParam for ($($param,)*) {
             type State = ($($param::State,)*);
             type Item<'w, 's> = ($($param::Item::<'w, 's>,)*);
+            const MAY_APPLY_DEFERRED: bool = false $(|| $param::MAY_APPLY_DEFERRED)*;
 
             #[inline]
             #[track_caller]
@@ -2235,6 +2300,7 @@ unsafe impl<'w, 's, P: ReadOnlySystemParam + 'static> ReadOnlySystemParam
 unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_, P> {
     type State = P::State;
     type Item<'world, 'state> = StaticSystemParam<'world, 'state, P>;
+    const MAY_APPLY_DEFERRED: bool = P::MAY_APPLY_DEFERRED;
 
     fn init_state(world: &mut World) -> Self::State {
         P::init_state(world)
@@ -2273,6 +2339,7 @@ unsafe impl<P: SystemParam + 'static> SystemParam for StaticSystemParam<'_, '_, 
 unsafe impl<T: ?Sized> SystemParam for PhantomData<T> {
     type State = ();
     type Item<'world, 'state> = Self;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {}
 
@@ -2337,6 +2404,7 @@ unsafe impl<D: QueryData + 'static, F: QueryFilter + 'static> ReadOnlySystemPara
 unsafe impl<P: SystemParam + 'static> SystemParam for &'_ mut SystemState<P> {
     type State = SystemState<P>;
     type Item<'world, 'state> = &'state mut SystemState<P>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         SystemState::new(world)
@@ -2667,6 +2735,7 @@ unsafe impl SystemParam for FilteredResources<'_, '_> {
     type State = Access;
 
     type Item<'world, 'state> = FilteredResources<'world, 'state>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {
         Access::new()
@@ -2712,6 +2781,7 @@ unsafe impl SystemParam for FilteredResourcesMut<'_, '_> {
     type State = Access;
 
     type Item<'world, 'state> = FilteredResourcesMut<'world, 'state>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(_world: &mut World) -> Self::State {
         Access::new()
@@ -2838,12 +2908,177 @@ mod tests {
     use bevy_ecs_macros::Component;
 
     use super::*;
+    use crate::change_detection::{DetectChanges, Mut};
+    use crate::lifecycle::Remove;
+    use crate::observer::On;
     use crate::query::Without;
     use crate::resource::IsResource;
     use crate::schedule::Schedule;
     use crate::system::{assert_is_system, Commands, IntoSystem, System};
     use crate::world::EntityMut;
     use core::cell::RefCell;
+
+    #[derive(Resource, PartialEq, Debug)]
+    struct Cached(u32);
+
+    #[test]
+    fn res_fetch_keeps_its_pointers_across_removal_and_reinsertion() {
+        let mut world = World::new();
+        world.insert_resource(Cached(1));
+        let id = world.component_id::<Cached>().unwrap();
+        let mut system = IntoSystem::into_system(|value: Res<Cached>| value.0);
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), 1);
+        let version = |world: &World| {
+            world
+                .storages()
+                .sparse_sets
+                .get(id)
+                .unwrap()
+                .structure_version()
+                .moved
+                .load(core::sync::atomic::Ordering::Relaxed)
+        };
+        let before = version(&world);
+        // Extraction moves a resource out and back in every frame; nothing else in its storage
+        // moves, so cached fetches stay valid and see the new value.
+        let taken = world.remove_resource::<Cached>().unwrap();
+        world.insert_resource(Cached(taken.0 + 1));
+        assert_eq!(version(&world), before);
+        assert_eq!(system.run((), &mut world).unwrap(), 2);
+    }
+
+    #[test]
+    fn res_fetch_follows_removal_and_reinsertion() {
+        let mut world = World::new();
+        let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        system.initialize(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), None);
+        world.insert_resource(Cached(1));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(1));
+        world.remove_resource::<Cached>();
+        assert_eq!(system.run((), &mut world).unwrap(), None);
+        world.insert_resource(Cached(2));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(2));
+        world.insert_resource(Cached(3));
+        assert_eq!(system.run((), &mut world).unwrap(), Some(3));
+    }
+
+    /// What a cached `Option<Res<Cached>>` fetch sees, next to what a fresh, uncached one sees.
+    fn cached_and_fresh(
+        cached: &mut impl System<In = (), Out = Option<u32>>,
+        world: &mut World,
+    ) -> (Option<u32>, Option<u32>) {
+        let mut fresh = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        fresh.initialize(world);
+        (
+            cached.run((), world).unwrap(),
+            fresh.run((), world).unwrap(),
+        )
+    }
+
+    fn read_cached(world: &mut World) -> impl System<In = (), Out = Option<u32>> {
+        let mut system = IntoSystem::into_system(|value: Option<Res<Cached>>| value.map(|v| v.0));
+        system.initialize(world);
+        system
+    }
+
+    #[test]
+    fn res_fetch_misses_a_resource_whose_marker_was_removed() {
+        #[derive(Resource)]
+        struct Other;
+        #[derive(Resource, Default)]
+        struct Seen(Vec<Option<u32>>);
+
+        let mut world = World::new();
+        world.insert_resource(Cached(1));
+        world.insert_resource(Other);
+        world.init_resource::<Seen>();
+        world.add_observer(
+            |_: On<Remove<IsResource>>, value: Option<Res<Cached>>, mut seen: ResMut<Seen>| {
+                seen.0.push(value.map(|v| v.0));
+            },
+        );
+        let entity_of = |world: &World, id| world.resource_entities().get(id).unwrap();
+        let other = entity_of(&world, world.component_id::<Other>().unwrap());
+        let cached = entity_of(&world, world.component_id::<Cached>().unwrap());
+        // The first removal warms the observer's fetch while the resource is reachable.
+        world.entity_mut(other).remove::<IsResource>();
+        // Unregistering the resource hides it before its value is removed.
+        world.entity_mut(cached).remove::<IsResource>();
+        assert_eq!(world.resource::<Seen>().0, [Some(1), None]);
+    }
+
+    #[test]
+    fn res_fetch_follows_cleared_entities() {
+        let mut world = World::new();
+        world.insert_resource(Cached(7));
+        let mut system = read_cached(&mut world);
+        assert_eq!(
+            cached_and_fresh(&mut system, &mut world),
+            (Some(7), Some(7))
+        );
+        world.clear_entities();
+        let (cached, fresh) = cached_and_fresh(&mut system, &mut world);
+        assert_eq!(cached, fresh);
+    }
+
+    #[test]
+    fn res_fetch_survives_moving_and_swapping_the_world() {
+        let mut world = World::new();
+        world.insert_resource(Cached(3));
+        let mut system = read_cached(&mut world);
+        assert_eq!(system.run((), &mut world).unwrap(), Some(3));
+        // Extraction moves the main world in and out of another world's resource like this.
+        let mut moved = core::mem::take(&mut world);
+        assert_eq!(system.run((), &mut moved).unwrap(), Some(3));
+        let mut holder = Some(moved);
+        let mut world = holder.take().unwrap();
+        world.resource_mut::<Cached>().0 = 4;
+        assert_eq!(system.run((), &mut world).unwrap(), Some(4));
+    }
+
+    #[test]
+    #[should_panic = "Encountered a mismatched World"]
+    fn res_fetch_state_rejects_another_world() {
+        let mut first = World::new();
+        first.insert_resource(Cached(1));
+        let mut system = read_cached(&mut first);
+        system.run((), &mut first).unwrap();
+        let mut second = World::new();
+        second.insert_resource(Cached(2));
+        let _ = system.run((), &mut second);
+    }
+
+    #[test]
+    fn res_mut_writes_reach_a_resource_moved_by_resource_scope() {
+        let mut world = World::new();
+        world.insert_resource(Cached(0));
+        let mut increment = IntoSystem::into_system(|mut value: ResMut<Cached>| value.0 += 1);
+        increment.initialize(&mut world);
+        increment.run((), &mut world).unwrap();
+        world.resource_scope(|world, mut value: Mut<Cached>| {
+            value.0 += 10;
+            world.spawn(Cached(55));
+        });
+        increment.run((), &mut world).unwrap();
+        assert_eq!(world.resource::<Cached>(), &Cached(12));
+    }
+
+    #[test]
+    fn res_fetch_keeps_change_detection() {
+        let mut world = World::new();
+        world.insert_resource(Cached(0));
+        let mut changed = IntoSystem::into_system(|value: Res<Cached>| value.is_changed());
+        changed.initialize(&mut world);
+        assert!(changed.run((), &mut world).unwrap());
+        assert!(!changed.run((), &mut world).unwrap());
+        world.resource_mut::<Cached>().0 = 4;
+        assert!(changed.run((), &mut world).unwrap());
+        assert!(!changed.run((), &mut world).unwrap());
+        world.insert_resource(Cached(5));
+        assert!(changed.run((), &mut world).unwrap());
+    }
 
     #[test]
     #[should_panic]

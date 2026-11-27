@@ -72,6 +72,7 @@ where
 {
     type State = ExtractState<P>;
     type Item<'w, 's> = Extract<'w, 's, P>;
+    const MAY_APPLY_DEFERRED: bool = false;
 
     fn init_state(world: &mut World) -> Self::State {
         let mut main_world = world.resource_mut::<MainWorld>();

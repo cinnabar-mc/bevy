@@ -6,6 +6,10 @@ use crate::{
     storage::{AbortOnPanic, Column, TableRow, VecExtensions},
 };
 use alloc::{boxed::Box, vec::Vec};
+use bevy_platform::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use bevy_ptr::{OwningPtr, Ptr};
 use core::{cell::UnsafeCell, hash::Hash, marker::PhantomData, num::NonZero, panic::Location};
 use nonmax::{NonMaxU32, NonMaxUsize};
@@ -165,6 +169,34 @@ pub struct ComponentSparseSet {
     #[cfg(debug_assertions)]
     entities: Vec<Entity>,
     sparse: SparseArray<EntityIndex, TableRow>,
+    /// Counters that tell cached pointers into this set whether they are still valid; see
+    /// [`SetVersions`].
+    structure_version: Arc<SetVersions>,
+}
+
+/// Change counters of one [`ComponentSparseSet`], shared with pointer caches.
+///
+/// A pointer read for an entity's value stays valid while `moved` is unchanged and the entity
+/// still has its value at the row it was read at. That holds trivially while `removed` is also
+/// unchanged; otherwise it is confirmed by looking the entity's row up again.
+#[derive(Debug, Default)]
+pub(crate) struct SetVersions {
+    /// Advances whenever stored values move: the dense storage reallocates, a removal swaps the
+    /// last value into the freed row, or the set is cleared. Adding a value without reallocating
+    /// or removing the last row moves nothing.
+    pub(crate) moved: AtomicU64,
+    /// Advances on every removal, so a cache knows when to confirm its entity's row.
+    pub(crate) removed: AtomicU64,
+}
+
+/// Advances `counter`. Callers hold exclusive world access, so a plain load and store cannot race
+/// a reader or another writer, and avoid a locked read-modify-write.
+#[inline]
+fn advance(counter: &AtomicU64) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
 }
 
 impl ComponentSparseSet {
@@ -176,11 +208,35 @@ impl ComponentSparseSet {
             dense: Column::with_capacity(component_info, entities.capacity()),
             entities,
             sparse: Default::default(),
+            structure_version: Arc::new(SetVersions::default()),
         }
+    }
+
+    /// The counters that tell whether pointers returned by [`Self::get_with_ticks`] for an entity
+    /// still address that entity's value and change ticks; see [`SetVersions`].
+    #[inline]
+    pub(crate) fn structure_version(&self) -> &Arc<SetVersions> {
+        &self.structure_version
+    }
+
+    /// The row holding `entity`'s value, if it has one.
+    #[inline]
+    pub(crate) fn row(&self, entity: Entity) -> Option<TableRow> {
+        self.sparse.get(entity.index()).copied()
+    }
+
+    /// Marks every pointer into this set's storage as stale.
+    ///
+    /// Besides structural changes, resource hooks call this when a resource stops being reachable
+    /// through the world's resource map while its value is still stored.
+    #[inline]
+    pub(crate) fn advance_structure_version(&self) {
+        advance(&self.structure_version.moved);
     }
 
     /// Removes all of the values stored within.
     pub(crate) fn clear(&mut self) {
+        self.advance_structure_version();
         // SAFETY: This is using the size of the ComponentSparseSet.
         unsafe { self.dense.clear(self.len()) };
         self.entities.clear();
@@ -234,6 +290,7 @@ impl ComponentSparseSet {
             // We create an AbortOnPanic guard to force panics to terminate the process if this occurs.
             let _guard = AbortOnPanic;
             if capacity != self.entities.capacity() {
+                self.advance_structure_version();
                 // SAFETY: An entity was just pushed onto `entities`, its capacity cannot be zero.
                 let new_capacity = unsafe { NonZero::new_unchecked(self.entities.capacity()) };
                 if let Some(capacity) = NonZero::new(capacity) {
@@ -371,6 +428,7 @@ impl ComponentSparseSet {
     #[must_use = "The returned pointer must be used to drop the removed component."]
     pub(crate) fn remove_and_forget(&mut self, entity: Entity) -> Option<OwningPtr<'_>> {
         self.sparse.remove(entity.index()).map(|dense_index| {
+            advance(&self.structure_version.removed);
             #[cfg(debug_assertions)]
             assert_eq!(entity, self.entities[dense_index.index()]);
             let last = self.entities.len() - 1;
@@ -389,6 +447,8 @@ impl ComponentSparseSet {
                         .promote()
                 }
             } else {
+                // The last value moves into the freed row.
+                self.advance_structure_version();
                 // SAFETY: The above check ensures that `dense_index` and the last element are not
                 // overlapping, and thus also within bounds.
                 unsafe {
@@ -423,6 +483,7 @@ impl ComponentSparseSet {
         self.sparse
             .remove(entity.index())
             .map(|dense_index| {
+                advance(&self.structure_version.removed);
                 #[cfg(debug_assertions)]
                 assert_eq!(entity, self.entities[dense_index.index()]);
                 let last = self.entities.len() - 1;
@@ -436,6 +497,8 @@ impl ComponentSparseSet {
                     // the `entities` store.
                     unsafe { self.dense.drop_last_component(last) };
                 } else {
+                    // The last value moves into the freed row.
+                    self.advance_structure_version();
                     // SAFETY: The above check ensures that `dense_index` and the last element are not
                     // overlapping, and thus also within bounds.
                     unsafe {
@@ -860,6 +923,66 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq)]
     struct Foo(usize);
+
+    #[test]
+    fn structure_version_advances_when_stored_values_move() {
+        use crate::world::World;
+        use core::sync::atomic::Ordering;
+
+        #[derive(Component)]
+        #[component(storage = "SparseSet")]
+        struct Sparse;
+
+        let mut world = World::new();
+        let id = world.register_component::<Sparse>();
+        let first = world.spawn(Sparse).id();
+        let version = |world: &World| {
+            world
+                .storages()
+                .sparse_sets
+                .get(id)
+                .unwrap()
+                .structure_version()
+                .moved
+                .load(Ordering::Relaxed)
+        };
+        let mut last = version(&world);
+        let mut advanced = |world: &World| {
+            let now = version(world);
+            let moved = now != last;
+            last = now;
+            moved
+        };
+
+        world.entity_mut(first).insert(Sparse);
+        assert!(
+            !advanced(&world),
+            "replacing a value in place keeps pointers valid"
+        );
+        // Values added within capacity move nothing; growing past it reallocates.
+        let mut added = Vec::new();
+        let mut grew = false;
+        for _ in 0..64 {
+            added.push(world.spawn(Sparse).id());
+            grew |= advanced(&world);
+        }
+        assert!(grew, "growing the storage reallocates it");
+        let second = *added.last().unwrap();
+        world.entity_mut(second).remove::<Sparse>();
+        assert!(!advanced(&world), "removing the last row moves nothing");
+        world.entity_mut(second).insert(Sparse);
+        assert!(!advanced(&world), "adding within capacity moves nothing");
+        world.entity_mut(first).remove::<Sparse>();
+        assert!(
+            advanced(&world),
+            "removing an earlier row moves the last value into it"
+        );
+        world.entity_mut(first).insert(Sparse);
+        world.despawn(added[0]);
+        assert!(advanced(&world), "despawning swaps the last value in");
+        world.clear_entities();
+        assert!(advanced(&world), "clearing drops every value");
+    }
 
     #[test]
     fn sparse_set() {
