@@ -137,9 +137,21 @@ impl RenderAppChannels {
     }
 
     /// Send the `render_app` to the rendering thread.
-    pub fn send_blocking(&mut self, render_app: SubApp) {
-        self.app_to_render_sender.send_blocking(render_app).unwrap();
-        self.render_app_in_render_thread = true;
+    ///
+    /// Returns `false` when the render thread is gone, for example after a panic in its frame tail
+    /// while the main app was extracting. The render app is then dropped on this thread, where its
+    /// non-send data was initialized.
+    pub fn send_blocking(&mut self, render_app: SubApp) -> bool {
+        match self.app_to_render_sender.send_blocking(render_app) {
+            Ok(()) => {
+                self.render_app_in_render_thread = true;
+                true
+            }
+            Err(returned) => {
+                drop(returned.into_inner());
+                false
+            }
+        }
     }
 
     /// Polls for the render app when the render thread is predicted to send it back within the
@@ -427,12 +439,13 @@ fn renderer_extract(app_world: &mut World, _world: &mut World) {
                         .pop()
                         .unwrap()
                 });
-            if let Some(mut render_app) = render_app {
+            // The render thread is gone if it can neither send the render app back nor take it:
+            // it panicked during the render update, or in its frame tail after returning the app.
+            let sent = render_app.is_some_and(|mut render_app| {
                 render_app.extract(world);
-
-                render_channels.send_blocking(render_app);
-            } else {
-                // Renderer thread panicked
+                render_channels.send_blocking(render_app)
+            });
+            if !sent {
                 world.write_message(AppExit::error());
             }
         });
@@ -803,6 +816,45 @@ mod tests {
                 Some(&"render app drop panic")
             );
             render_thread.join().unwrap();
+        });
+    }
+
+    /// A render thread that returned the render app and then panicked in its frame tail is gone
+    /// by the time the main app sends the extracted app back. That send must end the app with an
+    /// error, as a panic during the render update does, instead of panicking the main thread.
+    #[test]
+    fn a_render_thread_gone_after_returning_the_app_ends_the_app_with_an_error() {
+        run_on_main_thread(|| {
+            let (app_to_render_sender, app_to_render_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let (render_to_app_sender, render_to_app_receiver) =
+                async_channel::bounded::<SubApp>(1);
+            let executor = MainThreadExecutor::new();
+            let mut main_world = World::new();
+            main_world.init_resource::<bevy_ecs::message::Messages<AppExit>>();
+            main_world.insert_resource(executor.clone());
+            let mut channels =
+                RenderAppChannels::new(app_to_render_sender, render_to_app_receiver, executor);
+            channels.send_blocking(SubApp::new());
+            main_world.insert_resource(channels);
+            // The render thread sends the app back, then dies before taking the next one.
+            let render_app = app_to_render_receiver.recv_blocking().unwrap();
+            render_to_app_sender.send_blocking(render_app).unwrap();
+            drop(app_to_render_receiver);
+
+            renderer_extract(&mut main_world, &mut World::new());
+
+            let exits = main_world.resource::<bevy_ecs::message::Messages<AppExit>>();
+            assert_eq!(
+                exits.iter_current_update_messages().collect::<Vec<_>>(),
+                [&AppExit::error()]
+            );
+            assert!(
+                !main_world
+                    .resource::<RenderAppChannels>()
+                    .render_app_in_render_thread,
+                "the unsent render app was dropped here, so shutdown must not wait for it"
+            );
         });
     }
 }
