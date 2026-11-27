@@ -719,14 +719,17 @@ pub fn prepare_core_3d_depth_textures(
             })
             .clone();
 
-        commands.entity(entity).insert(ViewDepthStencilTexture::new(
-            cached_texture,
-            match camera_3d.depth_load_op {
-                Camera3dDepthLoadOp::Clear(v) => Some(v),
-                Camera3dDepthLoadOp::Load => None,
-            },
-            None,
-        ));
+        commands
+            .entity(entity)
+            .insert(ViewDepthStencilTexture::from_texture_cache(
+                cached_texture,
+                match camera_3d.depth_load_op {
+                    Camera3dDepthLoadOp::Clear(v) => Some(v),
+                    Camera3dDepthLoadOp::Load => None,
+                },
+                None,
+                &texture_cache,
+            ));
     }
 }
 
@@ -990,6 +993,7 @@ pub fn prepare_prepass_textures(
                 cached_depth_texture1,
                 cached_depth_texture2,
                 frame_count.0,
+                &texture_cache,
             ),
             normal: cached_normals_texture
                 .map(|t| ColorAttachment::new(t, None, None, Some(LinearRgba::BLACK.into()))),
@@ -1042,13 +1046,15 @@ fn package_double_buffered_depth_texture(
     texture1: Option<CachedTexture>,
     texture2: Option<CachedTexture>,
     frame_count: u32,
+    cache: &TextureCache,
 ) -> Option<DepthStencilAttachment> {
+    let attachment = |current, previous| {
+        DepthStencilAttachment::from_texture_cache(current, previous, Some(0.0), None, cache)
+    };
     match (texture1, texture2) {
-        (Some(t1), None) => Some(DepthStencilAttachment::new(t1, None, Some(0.0), None)),
-        (Some(t1), Some(t2)) if frame_count.is_multiple_of(2) => {
-            Some(DepthStencilAttachment::new(t1, Some(t2), Some(0.0), None))
-        }
-        (Some(t1), Some(t2)) => Some(DepthStencilAttachment::new(t2, Some(t1), Some(0.0), None)),
+        (Some(t1), None) => Some(attachment(t1, None)),
+        (Some(t1), Some(t2)) if frame_count.is_multiple_of(2) => Some(attachment(t1, Some(t2))),
+        (Some(t1), Some(t2)) => Some(attachment(t2, Some(t1))),
         _ => None,
     }
 }

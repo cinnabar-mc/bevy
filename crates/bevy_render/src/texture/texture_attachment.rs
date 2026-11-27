@@ -1,4 +1,4 @@
-use super::CachedTexture;
+use super::{CachedTexture, TextureCache};
 use crate::render_resource::{TextureFormat, TextureView};
 use alloc::sync::Arc;
 use bevy_color::LinearRgba;
@@ -156,10 +156,12 @@ impl DepthStencilViews {
 
     /// Create the appropriate views for a depth-stencil texture based on its texture format.
     ///
-    /// Formats with a single aspect reuse the cached texture's default view, whose all-aspects
-    /// view is that aspect, rather than creating a view every frame. A view created every frame
-    /// makes Vulkan create and destroy a framebuffer for every pass that attaches it.
-    fn from_texture(texture: &CachedTexture) -> Self {
+    /// With `reuse_default_view`, which callers pass only for a texture whose `default_view`
+    /// [`TextureCache`] created with the default descriptor, the all-aspects attachment view, and
+    /// for single-aspect formats the aspect view too, reuse it rather than creating a view every
+    /// frame. A view created every frame makes Vulkan create and destroy a framebuffer for every
+    /// pass that attaches it.
+    fn from_texture(texture: &CachedTexture, reuse_default_view: bool) -> Self {
         let depth_view = || {
             texture.texture.create_view(&TextureViewDescriptor {
                 aspect: wgpu::TextureAspect::DepthOnly,
@@ -174,17 +176,29 @@ impl DepthStencilViews {
             })
         };
 
+        let all_aspects = |create: &dyn Fn() -> TextureView| {
+            if reuse_default_view {
+                texture.default_view.clone()
+            } else {
+                create()
+            }
+        };
+
         match texture.texture.format().channels() {
             wgpu_types::TextureChannel::DEPTH_STENCIL => DepthStencilViews::DepthStencil {
-                combined_view: texture.default_view.clone(),
+                combined_view: all_aspects(&|| {
+                    texture
+                        .texture
+                        .create_view(&TextureViewDescriptor::default())
+                }),
                 depth_view: depth_view(),
                 stencil_view: stencil_view(),
             },
             wgpu_types::TextureChannel::DEPTH => DepthStencilViews::DepthOnly {
-                depth_view: texture.default_view.clone(),
+                depth_view: all_aspects(&depth_view),
             },
             wgpu_types::TextureChannel::STENCIL => DepthStencilViews::StencilOnly {
-                stencil_view: texture.default_view.clone(),
+                stencil_view: all_aspects(&stencil_view),
             },
             _ => {
                 panic!(
@@ -209,17 +223,55 @@ impl DepthStencilAttachment {
         &self.depth_stencil_view_attachment.depth_stencil_views
     }
 
+    /// Creates the attachment's views from `texture` and `previous_frame_texture`. Their
+    /// `default_view`s are not trusted, so every view is created here; for textures from a
+    /// [`TextureCache`], [`Self::from_texture_cache`] reuses them instead.
     pub fn new(
         texture: CachedTexture,
         previous_frame_texture: Option<CachedTexture>,
         depth_clear_value: Option<f32>,
         stencil_clear_value: Option<u32>,
     ) -> Self {
-        let depth_stencil_views = DepthStencilViews::from_texture(&texture);
+        Self::with_views(
+            texture,
+            previous_frame_texture,
+            depth_clear_value,
+            stencil_clear_value,
+            |_| false,
+        )
+    }
 
-        let previous_frame_depth_stencil_views = previous_frame_texture
-            .as_ref()
-            .map(DepthStencilViews::from_texture);
+    /// Like [`Self::new`], but reuses the default view of each texture `cache` created, so an
+    /// attachment prepared every frame from the same cached texture attaches the same view.
+    pub fn from_texture_cache(
+        texture: CachedTexture,
+        previous_frame_texture: Option<CachedTexture>,
+        depth_clear_value: Option<f32>,
+        stencil_clear_value: Option<u32>,
+        cache: &TextureCache,
+    ) -> Self {
+        Self::with_views(
+            texture,
+            previous_frame_texture,
+            depth_clear_value,
+            stencil_clear_value,
+            |texture| cache.created_default_view(texture),
+        )
+    }
+
+    fn with_views(
+        texture: CachedTexture,
+        previous_frame_texture: Option<CachedTexture>,
+        depth_clear_value: Option<f32>,
+        stencil_clear_value: Option<u32>,
+        reuse_default_view: impl Fn(&CachedTexture) -> bool,
+    ) -> Self {
+        let views = |texture: &CachedTexture| {
+            DepthStencilViews::from_texture(texture, reuse_default_view(texture))
+        };
+        let depth_stencil_views = views(&texture);
+
+        let previous_frame_depth_stencil_views = previous_frame_texture.as_ref().map(views);
 
         Self {
             texture,
@@ -453,13 +505,8 @@ mod tests {
     use crate::{test_utils::create_dummy_device, texture::TextureCache};
     use wgpu::{Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 
-    /// A depth attachment prepared every frame from the same cached texture attaches the same
-    /// view each time, so passes that use it keep their framebuffers.
-    #[test]
-    fn depth_attachments_reuse_the_cached_default_view() {
-        let (device, _queue) = create_dummy_device();
-        let mut cache = TextureCache::default();
-        let descriptor = TextureDescriptor {
+    fn depth_descriptor() -> TextureDescriptor<'static> {
+        TextureDescriptor {
             label: None,
             size: Extent3d {
                 width: 4,
@@ -470,17 +517,72 @@ mod tests {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Depth32Float,
-            usage: TextureUsages::RENDER_ATTACHMENT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        };
-        let texture = cache.get(&device, descriptor);
+        }
+    }
+
+    /// A depth attachment prepared every frame from the same cached texture attaches the same
+    /// view each time, so passes that use it keep their framebuffers.
+    #[test]
+    fn depth_attachments_reuse_the_cached_default_view() {
+        let (device, _queue) = create_dummy_device();
+        let mut cache = TextureCache::default();
+        let texture = cache.get(&device, depth_descriptor());
         for _frame in 0..2 {
-            let attachment = DepthStencilAttachment::new(texture.clone(), None, Some(0.0), None);
+            let attachment = DepthStencilAttachment::from_texture_cache(
+                texture.clone(),
+                None,
+                Some(0.0),
+                None,
+                &cache,
+            );
             let views = attachment.depth_stencil_views();
             assert_eq!(views.attachment_view().id(), texture.default_view.id());
             assert_eq!(
                 views.depth_only_view().map(TextureView::id),
                 Some(texture.default_view.id())
+            );
+        }
+    }
+
+    /// A caller-built texture whose `default_view` is restricted to sampling cannot be attached,
+    /// so neither constructor attaches it; each creates its own view.
+    #[test]
+    fn a_restricted_caller_view_is_never_attached() {
+        let (device, _queue) = create_dummy_device();
+        let texture = device.create_texture(&depth_descriptor());
+        let restricted = texture.create_view(&TextureViewDescriptor {
+            usage: Some(TextureUsages::TEXTURE_BINDING),
+            ..Default::default()
+        });
+        let caller = CachedTexture {
+            texture,
+            default_view: restricted.clone(),
+        };
+        let cache = TextureCache::default();
+        for attachment in [
+            DepthStencilAttachment::new(caller.clone(), Some(caller.clone()), Some(0.0), None),
+            DepthStencilAttachment::from_texture_cache(
+                caller.clone(),
+                Some(caller.clone()),
+                Some(0.0),
+                None,
+                &cache,
+            ),
+        ] {
+            assert_ne!(
+                attachment.depth_stencil_views().attachment_view().id(),
+                restricted.id()
+            );
+            assert_ne!(
+                attachment
+                    .previous_frame_depth_stencil_views
+                    .as_ref()
+                    .unwrap()
+                    .attachment_view()
+                    .id(),
+                restricted.id()
             );
         }
     }

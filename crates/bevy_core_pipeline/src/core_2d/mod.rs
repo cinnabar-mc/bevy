@@ -459,10 +459,13 @@ pub fn prepare_core_2d_depth_textures(
             })
             .clone();
 
-        commands.entity(view).insert(ViewDepthStencilTexture::new(
-            cached_texture,
-            Some(0.0),
-            None,
-        ));
+        commands
+            .entity(view)
+            .insert(ViewDepthStencilTexture::from_texture_cache(
+                cached_texture,
+                Some(0.0),
+                None,
+                &texture_cache,
+            ));
     }
 }

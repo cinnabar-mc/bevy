@@ -1163,6 +1163,23 @@ impl ViewDepthStencilTexture {
         Self { attachment }
     }
 
+    /// Like [`Self::new`], for a texture from `cache`, whose default view the attachment reuses.
+    pub fn from_texture_cache(
+        texture: CachedTexture,
+        depth_clear_value: Option<f32>,
+        stencil_clear_value: Option<u32>,
+        cache: &TextureCache,
+    ) -> Self {
+        let attachment = DepthStencilAttachment::from_texture_cache(
+            texture,
+            None,
+            depth_clear_value,
+            stencil_clear_value,
+            cache,
+        );
+        Self { attachment }
+    }
+
     pub fn texture(&self) -> &Texture {
         &self.attachment.texture.texture
     }
