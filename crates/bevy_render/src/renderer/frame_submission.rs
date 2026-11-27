@@ -15,16 +15,25 @@ type DeferredSubmit = Box<dyn FnOnce() -> SubmissionIndex + Send>;
 /// finishing and submitting them.
 ///
 /// With this resource present, `RenderGraphSystems::Submit` can finish while the frame's command
-/// buffers are still on the CPU. Every system that runs after it in the render schedule must
-/// therefore follow this contract:
+/// buffers are still on the CPU, and they reach the queue only when the frame tail runs, which
+/// overlaps the next extraction on the main thread. Any code that uses the
+/// [`RenderQueue`](super::RenderQueue) while that submission is deferred, whether a render system
+/// after `Submit`, an extraction system on the main thread, or another thread holding the queue,
+/// must therefore follow this contract:
 ///
 /// - Work that must follow the frame's submission, such as completion callbacks registered with
 ///   [`wgpu::Queue::on_submitted_work_done`] or [`wgpu::Buffer::map_async`] requests for buffers
 ///   the frame writes, goes through [`FrameSubmission::after_submit`].
-/// - A system that submits command buffers to the [`RenderQueue`](super::RenderQueue) directly,
-///   rather than adding them to [`PendingCommandBuffers`](super::PendingCommandBuffers), calls
-///   [`FrameSubmission::flush`] first. Otherwise its submission reaches the queue before the
-///   frame's own and can read resources the frame has not drawn yet.
+/// - Command buffers submitted to the queue directly, rather than added to
+///   [`PendingCommandBuffers`](super::PendingCommandBuffers), are submitted after
+///   [`FrameSubmission::flush`]. Otherwise they reach the queue before the frame's own and can
+///   read resources the frame has not drawn yet.
+/// - Staged writes ([`wgpu::Queue::write_buffer`], [`wgpu::Queue::write_buffer_with`],
+///   [`wgpu::Queue::write_texture`]) to a resource the deferred frame reads or writes are issued
+///   after [`FrameSubmission::flush`]. A staged write executes before the command buffers of the
+///   next `submit`, so issued while the frame is deferred, a write meant for the next frame would
+///   land in this frame's draw. Writes to resources the deferred frame does not use, such as ones
+///   allocated for later frames, need no flush.
 ///
 /// Frames with screenshots, GPU readbacks or render diagnostics still submit immediately,
 /// because those map buffers right after the submission. Bevy never inserts this resource; an
@@ -44,14 +53,22 @@ struct FrameSubmissionState {
     queued: Vec<(u64, DeferredSubmit)>,
 }
 
+#[derive(Default)]
+struct FrameSubmissionShared {
+    state: Mutex<FrameSubmissionState>,
+    /// Held from taking deferred submissions off the queue until they are submitted, so a caller
+    /// that finds nothing left to take knows every earlier deferred submission reached the queue.
+    submitting: Mutex<()>,
+}
+
 /// Shared state of the frame's submission made in the [`RenderFrameTail`]: its index and the
 /// work that must follow it.
 #[derive(Resource, Clone, Default)]
-pub struct FrameSubmission(Arc<Mutex<FrameSubmissionState>>);
+pub struct FrameSubmission(Arc<FrameSubmissionShared>);
 
 impl FrameSubmission {
     fn state(&self) -> bevy_platform::sync::MutexGuard<'_, FrameSubmissionState> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `work` after every submission made so far, including one deferred into the frame
@@ -82,6 +99,27 @@ impl FrameSubmission {
         state.deferred
     }
 
+    /// Records the tail's submission `index` for deferred submission `sequence`, then runs the
+    /// waiting work if no later submission was deferred this frame.
+    #[cfg(test)]
+    fn finish_deferred(&self, sequence: u64, index: SubmissionIndex) {
+        for work in self.record_deferred(sequence, index).into_iter().flatten() {
+            work();
+        }
+    }
+
+    /// Records the submission `index` for deferred submission `sequence` and returns the work
+    /// waiting for it when no later submission was deferred this frame.
+    fn record_deferred(&self, sequence: u64, index: SubmissionIndex) -> Option<Vec<SubmitWork>> {
+        let mut state = self.state();
+        state.index = Some(index);
+        if state.deferred == sequence {
+            state.after.take()
+        } else {
+            None
+        }
+    }
+
     /// Queues `submit` as a deferred submission and returns its sequence number. The frame tail
     /// makes it with [`Self::run_deferred`], unless [`Self::flush`] made it earlier.
     pub(super) fn defer(&self, submit: DeferredSubmit) -> u64 {
@@ -93,16 +131,13 @@ impl FrameSubmission {
     /// Makes deferred submission `sequence`, and every one queued before it, if they are still
     /// waiting; a [`Self::flush`] may already have made them.
     pub(super) fn run_deferred(&self, sequence: u64) {
-        let due = {
-            let mut state = self.state();
-            let count = state
-                .queued
+        self.submit_due(|queued| {
+            let count = queued
                 .iter()
                 .take_while(|(queued, _)| *queued <= sequence)
                 .count();
-            state.queued.drain(..count).collect::<Vec<_>>()
-        };
-        self.submit_all(due);
+            queued.drain(..count).collect()
+        });
     }
 
     /// Makes every submission deferred into the frame tail now, in order, then runs the work
@@ -110,30 +145,32 @@ impl FrameSubmission {
     /// [`RenderQueue`](super::RenderQueue) directly call this first, so the frame's own
     /// submission reaches the queue before theirs. Does nothing when no submission is deferred.
     pub fn flush(&self) {
-        let due = core::mem::take(&mut self.state().queued);
-        self.submit_all(due);
+        self.submit_due(core::mem::take);
     }
 
-    fn submit_all(&self, due: Vec<(u64, DeferredSubmit)>) {
-        for (sequence, submit) in due {
-            let index = submit();
-            self.finish_deferred(sequence, index);
-        }
-    }
-
-    /// Records the tail's submission `index` for deferred submission `sequence`, then runs the
-    /// waiting work if no later submission was deferred this frame.
-    pub(super) fn finish_deferred(&self, sequence: u64, index: SubmissionIndex) {
-        let after = {
-            let mut state = self.state();
-            state.index = Some(index);
-            if state.deferred == sequence {
-                state.after.take()
-            } else {
-                None
+    /// Takes the deferred submissions `take` selects and submits them in order, then runs the work
+    /// waiting for them. Taking, submitting and recording their indices happen under one lock, so
+    /// a concurrent caller that finds nothing left returns only after those submissions reached
+    /// the queue; the waiting work runs after the lock is released.
+    fn submit_due(
+        &self,
+        take: impl FnOnce(&mut Vec<(u64, DeferredSubmit)>) -> Vec<(u64, DeferredSubmit)>,
+    ) {
+        let waiting = {
+            let _submitting = self
+                .0
+                .submitting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let due = take(&mut self.state().queued);
+            let mut waiting = Vec::new();
+            for (sequence, submit) in due {
+                let index = submit();
+                waiting.extend(self.record_deferred(sequence, index).into_iter().flatten());
             }
+            waiting
         };
-        for work in after.into_iter().flatten() {
+        for work in waiting {
             work();
         }
     }
@@ -194,5 +231,56 @@ mod tests {
         assert!(submission.take_index().is_none());
         submission.after_submit(record(3));
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    /// A flush that finds the deferred submission already taken by another caller waits until
+    /// that caller has submitted it, so its own queue work still follows the frame's.
+    #[test]
+    fn a_concurrent_flush_waits_for_a_submission_another_caller_took() {
+        use core::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
+        use std::{sync::mpsc, thread};
+
+        const TIMEOUT: Duration = Duration::from_secs(10);
+        let submission = FrameSubmission::default();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let (taken, was_taken) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let flag = submitted.clone();
+        submission.defer(Box::new(move || {
+            taken.send(()).unwrap();
+            released.recv_timeout(TIMEOUT).unwrap();
+            flag.store(true, Ordering::SeqCst);
+            index()
+        }));
+        let first = {
+            let submission = submission.clone();
+            thread::spawn(move || submission.flush())
+        };
+        // The first caller has taken the submission and is submitting it.
+        was_taken.recv_timeout(TIMEOUT).unwrap();
+
+        let (done, returned) = mpsc::channel();
+        let second = {
+            let submission = submission.clone();
+            let submitted = submitted.clone();
+            thread::spawn(move || {
+                submission.flush();
+                done.send(submitted.load(Ordering::SeqCst)).unwrap();
+            })
+        };
+        assert!(
+            returned.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second flush returned before the first caller submitted"
+        );
+        release.send(()).unwrap();
+        assert!(
+            returned.recv_timeout(TIMEOUT).unwrap(),
+            "the second flush returned only after the submission"
+        );
+        first.join().unwrap();
+        second.join().unwrap();
     }
 }
