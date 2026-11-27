@@ -204,15 +204,14 @@ impl PendingCommandBuffers {
         {
             let commands = core::mem::take(&mut inner.commands);
             let queue = queue.clone();
-            let sequence = submission.begin_deferred();
-            let submission = submission.clone();
-            tail.defer(move || {
+            let sequence = submission.defer(Box::new(move || {
                 #[cfg(feature = "trace")]
                 let _span = info_span!("frame_tail_submit", count = commands.len()).entered();
                 let encoders = encoder_count(&commands);
-                let index = queue.submit(finish_commands(commands.into_iter(), encoders));
-                submission.finish_deferred(sequence, index);
-            });
+                queue.submit(finish_commands(commands.into_iter(), encoders))
+            }));
+            let submission = submission.clone();
+            tail.defer(move || submission.run_deferred(sequence));
         }
     }
 
@@ -759,9 +758,9 @@ mod tests {
     use super::*;
     use crate::renderer::RenderQueue;
     use crate::test_utils::create_dummy_device;
+    use alloc::sync::Arc;
     use bevy_ecs::schedule::Schedule;
     use bevy_tasks::TaskPool;
-    use alloc::sync::Arc;
 
     #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
     struct Outer;
@@ -959,6 +958,40 @@ mod tests {
             .is_none());
         tail.run();
         assert_eq!(*submitted.lock().unwrap(), Some(true));
+    }
+
+    /// A system after the graph's submission that submits to the queue directly flushes first, so
+    /// the frame's deferred submission reaches the queue before its own.
+    #[test]
+    fn a_flush_makes_the_deferred_submission_before_the_tail_runs() {
+        let mut world = world();
+        let mut schedule = schedule(Outer, true);
+        schedule.add_systems((encode, add_buffer).chain());
+        schedule.run(&mut world);
+        let queue = world.resource::<RenderQueue>().clone();
+        let tail = RenderFrameTail::default();
+        let submission = FrameSubmission::default();
+        world
+            .resource_mut::<PendingCommandBuffers>()
+            .submit_in_tail(&queue, &tail, &submission);
+        let ran = Arc::new(Mutex::new(false));
+        let flag = ran.clone();
+        submission.after_submit(move || *flag.lock().unwrap() = true);
+        assert!(!*ran.lock().unwrap(), "the frame has not submitted yet");
+
+        submission.flush();
+        let flushed = submission
+            .take_index()
+            .expect("the flush submitted the frame");
+        assert!(*ran.lock().unwrap(), "work waiting for the submission ran");
+        // A direct submission after the flush is ordered after the frame's.
+        let direct = queue.submit([]);
+        assert!(submission_number(&direct) > submission_number(&flushed));
+        tail.run();
+        assert!(
+            submission.take_index().is_none(),
+            "the tail found nothing left to submit"
+        );
     }
 
     #[test]

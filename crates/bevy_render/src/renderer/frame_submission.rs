@@ -8,16 +8,27 @@ use wgpu::SubmissionIndex;
 use super::{FrameTailOnRenderThread, RenderFrameTail};
 
 type SubmitWork = Box<dyn FnOnce() + Send>;
+type DeferredSubmit = Box<dyn FnOnce() -> SubmissionIndex + Send>;
 
 /// Opts the render world into submitting the render graph's command buffers in the
 /// [`RenderFrameTail`], after the render app is handed back, so the next extraction overlaps
 /// finishing and submitting them.
 ///
-/// Work that must follow the frame's submission, such as completion callbacks registered with
-/// [`wgpu::Queue::on_submitted_work_done`] or [`wgpu::Buffer::map_async`] requests for buffers
-/// the frame writes, must go through [`FrameSubmission::after_submit`] once the graph has run.
+/// With this resource present, `RenderGraphSystems::Submit` can finish while the frame's command
+/// buffers are still on the CPU. Every system that runs after it in the render schedule must
+/// therefore follow this contract:
+///
+/// - Work that must follow the frame's submission, such as completion callbacks registered with
+///   [`wgpu::Queue::on_submitted_work_done`] or [`wgpu::Buffer::map_async`] requests for buffers
+///   the frame writes, goes through [`FrameSubmission::after_submit`].
+/// - A system that submits command buffers to the [`RenderQueue`](super::RenderQueue) directly,
+///   rather than adding them to [`PendingCommandBuffers`](super::PendingCommandBuffers), calls
+///   [`FrameSubmission::flush`] first. Otherwise its submission reaches the queue before the
+///   frame's own and can read resources the frame has not drawn yet.
+///
 /// Frames with screenshots, GPU readbacks or render diagnostics still submit immediately,
-/// because those map buffers right after the submission.
+/// because those map buffers right after the submission. Bevy never inserts this resource; an
+/// application that does takes on the contract for every system it adds after the graph.
 #[derive(Resource, Default)]
 pub struct SubmitInFrameTail;
 
@@ -29,6 +40,8 @@ struct FrameSubmissionState {
     after: Option<Vec<SubmitWork>>,
     /// Counts deferred submissions, so only a frame's last one runs the waiting work.
     deferred: u64,
+    /// Deferred submissions not yet made, oldest first, with their sequence numbers.
+    queued: Vec<(u64, DeferredSubmit)>,
 }
 
 /// Shared state of the frame's submission made in the [`RenderFrameTail`]: its index and the
@@ -67,6 +80,45 @@ impl FrameSubmission {
         state.after.get_or_insert_with(Vec::new);
         state.deferred += 1;
         state.deferred
+    }
+
+    /// Queues `submit` as a deferred submission and returns its sequence number. The frame tail
+    /// makes it with [`Self::run_deferred`], unless [`Self::flush`] made it earlier.
+    pub(super) fn defer(&self, submit: DeferredSubmit) -> u64 {
+        let sequence = self.begin_deferred();
+        self.state().queued.push((sequence, submit));
+        sequence
+    }
+
+    /// Makes deferred submission `sequence`, and every one queued before it, if they are still
+    /// waiting; a [`Self::flush`] may already have made them.
+    pub(super) fn run_deferred(&self, sequence: u64) {
+        let due = {
+            let mut state = self.state();
+            let count = state
+                .queued
+                .iter()
+                .take_while(|(queued, _)| *queued <= sequence)
+                .count();
+            state.queued.drain(..count).collect::<Vec<_>>()
+        };
+        self.submit_all(due);
+    }
+
+    /// Makes every submission deferred into the frame tail now, in order, then runs the work
+    /// waiting for them. Systems after `RenderGraphSystems::Submit` that submit to the
+    /// [`RenderQueue`](super::RenderQueue) directly call this first, so the frame's own
+    /// submission reaches the queue before theirs. Does nothing when no submission is deferred.
+    pub fn flush(&self) {
+        let due = core::mem::take(&mut self.state().queued);
+        self.submit_all(due);
+    }
+
+    fn submit_all(&self, due: Vec<(u64, DeferredSubmit)>) {
+        for (sequence, submit) in due {
+            let index = submit();
+            self.finish_deferred(sequence, index);
+        }
     }
 
     /// Records the tail's submission `index` for deferred submission `sequence`, then runs the
