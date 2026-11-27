@@ -1354,11 +1354,7 @@ pub fn clear_view_attachments(mut view_target_attachments: ResMut<ViewTargetAtta
 
 pub fn cleanup_view_targets_for_resize(
     mut commands: Commands,
-    windows: Query<(
-        MainEntity,
-        &ExtractedWindow,
-        Option<&crate::view::window::SurfaceData>,
-    )>,
+    windows: Query<(MainEntity, &ExtractedWindow, Option<&SurfaceData>)>,
     cameras: Query<(Entity, &ExtractedCamera), With<ViewTarget>>,
 ) {
     for (entity, camera) in &cameras {
@@ -1367,7 +1363,7 @@ pub fn cleanup_view_targets_for_resize(
                 windows.iter().find(|(e, _, _)| *e == window_ref.entity())
             && (window.size_changed
                 || window.present_mode_changed
-                || surface.is_some_and(crate::view::window::SurfaceData::needs_reconfiguration))
+                || surface.is_some_and(SurfaceData::needs_reconfiguration))
         {
             commands.entity(entity).remove::<ViewTarget>();
         }

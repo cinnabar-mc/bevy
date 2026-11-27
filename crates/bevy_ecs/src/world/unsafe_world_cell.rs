@@ -21,10 +21,7 @@ use crate::{
     storage::{ComponentSparseSet, SetVersions, Storages, Table, TableRow},
     system::Commands,
 };
-use bevy_platform::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use bevy_platform::sync::{atomic::Ordering, Arc};
 use bevy_ptr::{Ptr, UnsafeCellDeref};
 use core::{
     any::TypeId, cell::UnsafeCell, fmt::Debug, marker::PhantomData, panic::Location, ptr::NonNull,
